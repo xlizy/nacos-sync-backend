@@ -1824,8 +1824,9 @@ func (e *Engine) instanceNeedsUpdate(d *direction, src, dst model.Instance) bool
 	return !reflect.DeepEqual(e.proxiedMetadata(d, src), dst.Metadata)
 }
 
-// ensureWorker 在每次对账前确认方向级写入节点。任何Worker 心跳查询异常都 fail-closed，
-// 防止多节点在无法看到彼此候选时退化为并发写。
+// ensureWorker 在每次对账前确认本节点的方向 Worker 心跳已在目标集群可见。
+// 这是存活登记而非选主：多个 Worker 可以同时写；查询/登记异常时 fail-closed，避免节点在
+// 无法确认自身登记状态时继续工作。
 func (e *Engine) ensureWorker(rd *runningDir) (bool, error) {
 	if e.worker == nil { // 纯单元测试替身不连接真实 Nacos
 		return true, nil
