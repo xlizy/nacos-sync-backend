@@ -324,6 +324,26 @@ func (e *Engine) monitorNamespaceWatches(ctx context.Context, link config.SyncLi
 			if _, ok := desired[key]; ok {
 				continue
 			}
+			// SearchConfig no longer lists this item. Confirm with GetConfig before
+			// treating it as deleted, then explicitly fire the target-side delete
+			// before removing the listener. Otherwise a delayed source delete event
+			// could be lost if this rescan cancels the listener first.
+			content, getErr := src.GetConfig(vo.ConfigParam{DataId: it.DataId, Group: it.Group})
+			if getErr != nil {
+				e.logger.Warn("verify removed config failed; listener retained for retry",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(getErr))
+				continue
+			}
+			if content != "" {
+				continue // search pagination/race; source still has the config
+			}
+			if err := e.forward(ctx, link, namespace, it.Group, it.DataId, "", src, tgt); err != nil {
+				e.logger.Warn("propagate removed config failed; listener retained for retry",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(err))
+				continue
+			}
 			if err := src.CancelListenConfig(vo.ConfigParam{DataId: it.DataId, Group: it.Group}); err != nil {
 				e.logger.Warn("cancel removed config listener failed",
 					zap.String("link", linkKey(link)), zap.String("ns", namespace),
