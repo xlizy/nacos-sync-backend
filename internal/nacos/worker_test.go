@@ -21,6 +21,8 @@ func TestWorkerScopesTracksAllHealthyWorkers(t *testing.T) {
 		workerInstance("10.0.0.3", 9696, "dir-b", "10.0.0.3:9696", false),
 		{Ip: "10.0.0.4", Port: 9696, Enable: true, Healthy: true,
 			Metadata: map[string]string{workerDirectionMeta: "dir-c", workerIDMeta: "10.0.0.4:9696"}},
+		{Ip: "10.0.0.5", Port: 9696, ClusterName: "WORKER_WRONG", Ephemeral: true, Enable: true, Healthy: true,
+			Metadata: map[string]string{workerDirectionMeta: "dir-d", workerIDMeta: "10.0.0.5:9696"}},
 	}
 	got := WorkerScopes(instances)
 	if len(got) != 1 || !got["dir-a"] {
