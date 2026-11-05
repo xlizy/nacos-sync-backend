@@ -776,14 +776,9 @@ func (e *Engine) stopDir(id string) {
 	e.mu.Unlock()
 }
 
-// cleanupDirection 方向被禁用/删除（或引擎停止）时，把它在目标集群代注册过的实例全部注销，并关闭本方向专属目标客户端。
-//
-// 为什么必须显式注销 + 关闭客户端：代注册实例是 ephemeral（gRPC 连接绑定，Nacos 3.x 仅支持此方式），
-// 由本服务显式 Deregister 移除；但 ephemeral 实例的注册会被 SDK 缓存在客户端的 registeredInstanceCached，
-// 连接重连时由 connection_event_listener.redoRegisterEachService 自动重声明回服务端。因此光 Deregister 不够——
-// 必须再 CloseClient 销毁该连接与其注册缓存（含已代注册实例），才能令服务端随连接关闭一并回收这些实例，
-// 否则「禁用同步后代注册服务下不了线」（实测：孤儿清扫每 60s 删一次、随即被重注册回来）。
-// 本方向专属客户端随方向停止而关闭，不会误伤其它方向的目标连接。
+// cleanupDirection 方向被禁用/删除（或引擎停止）时，关闭本方向所有实例级 ephemeral 发布连接。
+// SDK v2.3.5 按 service 缓存 RegisterInstance 的 redo 信息；每实例独立客户端确保关闭一个 publisher
+// 不会误删同服务的其他实例，关闭连接也会清空该实例的 SDK redo cache，避免断线重连后复活。
 func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 	if rd == nil {
 		return
@@ -1811,9 +1806,11 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 	rd.clientMu.Unlock()
 
 	created := false
+	usingLegacyClient := false
 	if client == nil {
 		if legacyClient != nil {
 			client = legacyClient
+			usingLegacyClient = true
 		} else {
 			if e.mgr == nil { e.setErr(d.ID, fmt.Errorf("nacos client manager is nil")); return }
 			nc, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
@@ -1837,9 +1834,9 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 	if err != nil {
 		err = fmt.Errorf("register proxied instance failed target_cluster=%q namespace=%q service=%q group=%q instance=%s: %w",
 			d.DstCID, d.Namespace, svc, defaultGroup, instKey(in), err)
-		if client != legacyClient && e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
+		if !usingLegacyClient && e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
 		rd.clientMu.Lock()
-		if rd.instanceClients[rk] == client { delete(rd.instanceClients, rk) }
+		delete(rd.instanceClients, rk)
 		rd.clientMu.Unlock()
 		rd.mu.Lock(); rd.failCount[rk]++; rd.mu.Unlock()
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
@@ -1851,7 +1848,11 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 	if created {
 		rd.clientMu.Lock()
 		rd.mu.Lock(); stopped := rd.stopped; rd.mu.Unlock()
-		if !stopped { rd.instanceClients[rk] = client; client = nil }
+		if !stopped {
+			if rd.instanceClients == nil { rd.instanceClients = make(map[string]naming_client.INamingClient) }
+			rd.instanceClients[rk] = client
+			client = nil
+		}
 		rd.clientMu.Unlock()
 		if client != nil && e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
 	}
