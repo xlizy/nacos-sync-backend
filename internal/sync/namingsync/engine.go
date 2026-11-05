@@ -8,22 +8,14 @@
 //   - 防回环：复制实例带 syncSource=NACOS，拉取源实例时过滤掉这些，避免 A→B→A 风暴；
 //     同时按 syncSourceCluster 归属，各方向仅清理自己产生的代注册实例，互不越界。
 //   - 生命周期（硬性要求：源节点不论优雅停还是崩溃停，代注册实例都要第一时间注销）：
-//     代注册实例采用 ephemeral=true（走 gRPC，Nacos 3.x 唯一可用的写路径；持久实例在 3.x
-//     已被移除 HTTP 写接口，会 501）。但 ephemeral 实例是「绑定到注册它的那条连接」——也就是
-//     绑定在「本同步服务」到目标集群的连接上，所以源节点停掉并不能让目标实例自动消失，必须
-//     由本服务主动 Deregister。为此采用三层检测，确保第一时间注销：
-//     ①' 源实例列表快轮询（确定性即时路径）：每 sourcePollInterval 通过 ClientManager.InstancesLive
-//     （每次用「瞬时 gRPC 客户端」直连源集群做实时查询，绕过 SDK 本地缓存）拉源集群「实时」实例列表，
-//     与已代注册集合对账，即时增删。之所以必须绕过 SDK 缓存：Nacos 3.x 已移除列出实例的 HTTP OpenAPI
-//     （实测 /v1/ns/instances 返回 501），唯一读路径是 gRPC；而 SDK 的 SelectAllInstances 读的是后台每
-//     ~10s 才刷新的本地缓存，导致「源实例消失→目标注销」延迟到 10s+。瞬时客户端（缓存为空，首次查询即触发
-//     实时 ServiceQuery）将优雅停注销收敛到 ≤sourcePollInterval。
-//     （早期曾试过 SDK 订阅推送，本环境实测「实例移除」推送延迟 ~9s，不可靠，已弃用。）
-//     ② TCP 主动探活：每 1s 探活源实例 ip:port，连续 2 次不可达即判定崩溃，立即注销目标代注册实例
-//     （~2s，独立于 Nacos 心跳，覆盖「崩溃停端口已关但 Nacos 心跳未超时」的窗口）。
-//     ③ 周期全量兜底对账（30s）：含目标漂移修正与失败注册重试，清理 Nacos 最终确认下线后的残留。
-//     三者都收敛到同一套 register/deregister 动作，幂等、互不冲突。
-//     （注：若本同步服务自身崩溃，代注册实例因 ephemeral 绑定本服务连接，会由目标集群自动摘除——天然 fail-safe。）
+//     代注册实例采用 ephemeral=true（走 gRPC），并绑定在本同步服务到目标集群的专属连接上。
+//     源实例消失时由两条路径收敛：
+//     ① 源实例列表快轮询：每 sourcePollInterval 通过 ClientManager.InstancesLive 使用独立 gRPC 查询
+//        拉取源端实时实例列表（绕过 SDK 本地缓存），与本方向 desired 集合对账并增删。
+//     ② 周期全量对账：修正目标漂移、补注册失败项，并清理源端已消失的残留。
+//     TCP 探活不再参与存活判定（K8S 网络策略下无法直连源 Pod，误判会误注销健康实例）；
+//     保留的 probe 仅处理 dead 集合中的恢复项，目前没有常规写入路径。
+//     （注：若本同步服务自身崩溃，代注册实例因 ephemeral 绑定本服务连接，会由目标集群自动摘除。）
 //
 // 拓扑解析（统一为「全互联」，没有主集群概念）：
 //   - 组内（single-sync，grp_id）：组内所有集群两两全互联（每个集群的原始实例同步到组内其余集群）。
@@ -1939,7 +1931,7 @@ func (e *Engine) rebuildDstClient(rd *runningDir) {
 
 // registerProxied 向目标集群发起代注册（临时实例 ephemeral=true，走 gRPC，Nacos 3.x 支持）。
 // 注意：Nacos 3.x 已移除持久实例的 HTTP 写接口，SDK 持久实例注册会被 501 拒绝，故必须用 ephemeral。
-// 生命周期通过本服务的快轮询（瞬时 gRPC 客户端绕过 SDK 缓存）/ TCP 探活 / 周期对账三层主动管理：源实例消失即 DeregisterInstance 注销。
+// 生命周期通过本服务的 Nacos 实时快轮询与周期全量对账管理：源实例消失即 DeregisterInstance 注销。
 func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string, _ model.Instance) {
 	// Recovery paths also publish the complete service snapshot.
 	e.registerServiceProxied(ctx, rd, svc)
