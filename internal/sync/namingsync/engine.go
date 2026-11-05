@@ -1708,6 +1708,28 @@ func validateUniquePublishers(natives map[string]model.Instance) error {
 	return nil
 }
 
+// nacosMetadataLength matches the Nacos server rule: sum the character lengths of all keys and values.
+// Java String.length() counts UTF-16 code units, so supplementary runes (for example emoji) count as two.
+func nacosMetadataLength(metadata map[string]string) int {
+	total := 0
+	for key, value := range metadata {
+		total += utf16Length(key) + utf16Length(value)
+	}
+	return total
+}
+
+func utf16Length(value string) int {
+	length := 0
+	for _, r := range value {
+		if r > 0xFFFF {
+			length += 2
+		} else {
+			length++
+		}
+	}
+	return length
+}
+
 func (e *Engine) proxiedMetadata(d *direction, in model.Instance) map[string]string {
 	md := make(map[string]string, len(in.Metadata)+2)
 	for k, v := range in.Metadata {
@@ -1776,10 +1798,11 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 	rd.mu.Unlock()
 
 	metadata := e.proxiedMetadata(d, in)
-	encoded, err := json.Marshal(metadata)
-	if err == nil && len(encoded) > 1024 {
-		err = fmt.Errorf("proxied metadata exceeds Nacos 1024-byte limit dir=%q service=%q instance=%q metadata_bytes=%d limit=1024",
-			d.ID, svc, instKey(in), len(encoded))
+	metadataLength := nacosMetadataLength(metadata)
+	var err error
+	if metadataLength > 1024 {
+		err = fmt.Errorf("proxied metadata exceeds Nacos 1024-character limit dir=%q service=%q instance=%q metadata_length=%d limit=1024",
+			d.ID, svc, instKey(in), metadataLength)
 	}
 	if err != nil {
 		rd.mu.Lock(); rd.failCount[rk]++; rd.mu.Unlock()
