@@ -281,9 +281,15 @@ func (e *Engine) watchNamespace(ctx context.Context, link config.SyncLink, names
 			}
 			continue
 		}
-		// setup 成功：阻塞直到取消，再逐一撤销监听（释放 SDK 回调，防止泄露）。
-		<-ctx.Done()
+		// setup 成功后持续巡检命名空间配置集合。Nacos ListenConfig 是按
+		// DataId/Group 注册的，不会收到“新建了另一个 DataId”的通知；
+		// 因此必须重新枚举，才能发现运行期间新增的配置项。
+		watched := make(map[string]dataRef, len(items))
 		for _, it := range items {
+			watched[dataRefKey(it)] = it
+		}
+		e.monitorNamespaceWatches(ctx, link, namespace, src, tgt, watched)
+		for _, it := range watched {
 			_ = src.CancelListenConfig(vo.ConfigParam{DataId: it.DataId, Group: it.Group})
 		}
 		return nil
@@ -293,6 +299,73 @@ func (e *Engine) watchNamespace(ctx context.Context, link config.SyncLink, names
 	}
 	return lastErr
 }
+
+// monitorNamespaceWatches 定期重新枚举命名空间，动态增删具体 DataId/Group 监听。
+func (e *Engine) monitorNamespaceWatches(ctx context.Context, link config.SyncLink, namespace string, src, tgt config_client.IConfigClient, watched map[string]dataRef) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		items, err := e.enumerate(ctx, src)
+		if err != nil {
+			e.logger.Warn("config namespace rescan failed; existing listeners retained",
+				zap.String("link", linkKey(link)), zap.String("ns", namespace), zap.Error(err))
+			continue
+		}
+		desired := make(map[string]dataRef, len(items))
+		for _, it := range items {
+			desired[dataRefKey(it)] = it
+		}
+		for key, it := range watched {
+			if _, ok := desired[key]; ok {
+				continue
+			}
+			if err := src.CancelListenConfig(vo.ConfigParam{DataId: it.DataId, Group: it.Group}); err != nil {
+				e.logger.Warn("cancel removed config listener failed",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(err))
+			}
+			delete(watched, key)
+		}
+		for key, it := range desired {
+			if _, ok := watched[key]; ok {
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if err := src.ListenConfig(vo.ConfigParam{
+				DataId: it.DataId,
+				Group: it.Group,
+				OnChange: func(ns, group, dataId, data string) {
+					e.onChange(ctx, link, namespace, group, dataId, data, src, tgt)
+				},
+			}); err != nil {
+				e.logger.Warn("listen newly discovered config failed; will retry on next scan",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(err))
+				continue
+			}
+			// Listener is installed before the initial publish so changes during
+			// propagation are not silently missed. If propagation fails, remove
+			// the listener and retry both steps on the next scan.
+			if err := e.initialPropagate(ctx, link, namespace, it, src, tgt); err != nil {
+				_ = src.CancelListenConfig(vo.ConfigParam{DataId: it.DataId, Group: it.Group})
+				e.logger.Warn("initial propagate for newly discovered config failed; will retry",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(err))
+				continue
+			}
+			watched[key] = it
+		}
+	}
+}
+
+func dataRefKey(it dataRef) string { return it.Group + "\x00" + it.DataId }
 
 // setupWatch 完成单次监听建立（建连 + 枚举 + 初始点火 + 注册监听）。失败时返回错误，由 watchNamespace 重试。
 // 成功时回传源客户端与已注册监听的配置项，供调用方在取消时逐一撤销监听（释放 SDK 回调）。
@@ -447,9 +520,17 @@ func (e *Engine) forward(ctx context.Context, link config.SyncLink, ns, group, d
 			case <-time.After(time.Duration(attempt) * time.Second): // 1s、2s 退避
 			}
 			// 重试前重取源端最新内容：避免把过期内容写回共享 DB（见函数注释）。
-			if fresh, err := src.GetConfig(vo.ConfigParam{DataId: dataId, Group: group}); err == nil {
-				data = fresh
+			fresh, err := src.GetConfig(vo.ConfigParam{DataId: dataId, Group: group})
+			if err != nil {
+				// Never publish the stale event payload after failing to verify the
+				// current source value: the source may have changed or been deleted.
+				lastErr = fmt.Errorf("refresh source config before retry: %w", err)
+				e.logger.Warn("refresh source config before retry failed",
+					zap.String("link", linkKey(link)), zap.String("dataId", dataId),
+					zap.Int("attempt", attempt+1), zap.Error(err))
+				continue
 			}
+			data = fresh
 		}
 		start := time.Now()
 		if data == "" {
