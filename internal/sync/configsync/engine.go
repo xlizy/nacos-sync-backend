@@ -539,19 +539,21 @@ func (e *Engine) forward(ctx context.Context, link config.SyncLink, ns, group, d
 				return ctx.Err()
 			case <-time.After(time.Duration(attempt) * time.Second): // 1s、2s 退避
 			}
-			// 重试前重取源端最新内容：避免把过期内容写回共享 DB（见函数注释）。
-			fresh, err := src.GetConfig(vo.ConfigParam{DataId: dataId, Group: group})
-			if err != nil {
-				// Never publish the stale event payload after failing to verify the
-				// current source value: the source may have changed or been deleted.
-				lastErr = fmt.Errorf("refresh source config before retry: %w", err)
-				e.logger.Warn("refresh source config before retry failed",
-					zap.String("link", linkKey(link)), zap.String("dataId", dataId),
-					zap.Int("attempt", attempt+1), zap.Error(err))
-				continue
-			}
-			data = fresh
 		}
+		// Listener callbacks are submitted to a concurrent worker pool, so an older
+		// event can execute after a newer event for the same DataId/Group. Always
+		// re-read the authoritative source immediately before deciding what to write,
+		// including on the first attempt; never trust the callback payload as current.
+		fresh, err := src.GetConfig(vo.ConfigParam{DataId: dataId, Group: group})
+		if err != nil {
+			lastErr = fmt.Errorf("refresh source config before publish: %w", err)
+			e.logger.Warn("refresh source config before publish failed",
+				zap.String("link", linkKey(link)), zap.String("dataId", dataId),
+				zap.Int("attempt", attempt+1), zap.Error(err))
+			continue
+		}
+		data = fresh
+
 		// Active-Active 节点各自维护本地 echo 表，其他节点无法识别本次写入来源。
 		// 发布前比较目标当前值：若另一个同步节点已写入相同内容，则只登记本地 echo
 		// 并跳过写操作，避免重复通知进一步触发跨节点回声。
