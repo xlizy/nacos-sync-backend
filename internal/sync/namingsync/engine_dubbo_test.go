@@ -1,10 +1,13 @@
 package namingsync
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cxcm/nacos-sync-backend/internal/config"
+	"github.com/nacos-group/nacos-sdk-go/v2/model"
 )
 
 // TestIsDubboService 锁定 dubbo 前缀过滤规则（已与业务方确认：dubbo 应用按接口注册，
@@ -119,5 +122,108 @@ func TestResolveDirectionsDubboWithoutServiceSync(t *testing.T) {
 	dirs := e.resolveDirections(cfg)
 	if len(dirs) != 4 {
 		t.Fatalf("dirs len = %d, want 4", len(dirs))
+	}
+}
+
+// TestDubboStaleServicesReturnsLastSuccess 锁定枚举失败容错的核心语义：
+// dubboStaleServices 返回上次成功枚举的服务列表，无论缓存是否过期。
+// 这使 dubbo 方向在枚举偶发失败/退避期间仍能沿用上次列表继续对账实例，
+// 像普通服务同步一样服务列表不丢失、不整方向停摆。
+func TestDubboStaleServicesReturnsLastSuccess(t *testing.T) {
+	dirID := "dubbo/G1/c1->G2/d1/"
+	want := []string{"providers:com.foo.Bar:1.0.0", "consumers:com.foo.Baz"}
+	e := &Engine{dubboDisco: map[string]*discoState{
+		dirID: {
+			lastAt:   time.Now().Add(-10 * time.Second), // 远超 dubboDiscoCache(2s)，缓存已过期
+			services: want,
+		},
+	}}
+	got := e.dubboStaleServices(&direction{ID: dirID})
+	if len(got) != len(want) {
+		t.Fatalf("dubboStaleServices len = %d, want %d (even when cache expired)", len(got), len(want))
+	}
+	for i, s := range want {
+		if got[i] != s {
+			t.Fatalf("dubboStaleServices[%d] = %q, want %q", i, got[i], s)
+		}
+	}
+}
+
+// TestDubboStaleServicesNilWhenNeverSucceeded 锁定从未成功枚举时返回 nil，
+// 调用方据此跳过本轮（无已知服务可对账）。
+func TestDubboStaleServicesNilWhenNeverSucceeded(t *testing.T) {
+	e := &Engine{dubboDisco: map[string]*discoState{}}
+	if got := e.dubboStaleServices(&direction{ID: "dubbo/none->none/"}); got != nil {
+		t.Fatalf("dubboStaleServices on unknown direction = %v, want nil", got)
+	}
+	e.dubboDisco["dubbo/x->y/"] = &discoState{} // lastAt 零值，从未成功
+	if got := e.dubboStaleServices(&direction{ID: "dubbo/x->y/"}); len(got) != 0 {
+		t.Fatalf("dubboStaleServices on never-succeeded direction = %v, want empty", got)
+	}
+}
+
+// TestDubboServicesForReconcileUnionsEnumAndRegistered 锁定重构核心语义：
+// dubbo 方向本轮对账列表 = 枚举结果 ∪ registered 服务名。
+// 消失的 dubbo 服务（provider 下线，枚举不再返回，但仍有代注册实例在 registered）
+// 仍被纳入对账列表 → fastPoll/syncService 会查它的源实例（返回空）→ 注销代注册实例。
+// 这与普通服务的对账路径完全一致，无需基于服务名集合的单独清理。
+func TestDubboServicesForReconcileUnionsEnumAndRegistered(t *testing.T) {
+	dirID := "dubbo/G1/c1->G2/d1/"
+	enumResult := []string{"providers:com.foo.Bar:1.0.0", "providers:com.foo.Baz"}
+	disappearedSvc := "providers:com.gone.Deprecated" // 已从枚举消失，但 registered 仍有代注册实例
+
+	e := &Engine{
+		dirs:       make(map[string]*direction),
+		runs:       make(map[string]*runningDir),
+		dubboDisco: map[string]*discoState{
+			dirID: {lastAt: time.Now(), services: enumResult}, // 有效缓存
+		},
+	}
+	rd := &runningDir{
+		d:          &direction{ID: dirID, Dubbo: true},
+		registered: map[string]regEntry{
+			regKey(disappearedSvc, model.Instance{Ip: "10.0.0.1", Port: 20880}): {
+				svc: disappearedSvc, inst: model.Instance{Ip: "10.0.0.1", Port: 20880},
+			},
+		},
+		failCount: map[string]int{},
+		dead:      map[string]regEntry{},
+	}
+	got := e.dubboServicesForReconcile(context.Background(), rd)
+
+	want := map[string]bool{
+		"providers:com.foo.Bar:1.0.0": true,
+		"providers:com.foo.Baz":       true,
+		disappearedSvc:                true, // 消失服务必须被纳入（由 registered 补入）
+	}
+	if len(got) != len(want) {
+		t.Fatalf("dubboServicesForReconcile len = %d, want %d (enum ∪ registered): got %v", len(got), len(want), got)
+	}
+	for _, s := range got {
+		if !want[s] {
+			t.Fatalf("unexpected service %q in reconcile list (want enum ∪ registered only)", s)
+		}
+	}
+}
+
+// TestDubboServicesForReconcileEnumOnly 锁定 registered 为空时只返回枚举结果
+// （新增 dubbo 方向首次枚举成功、尚无代注册实例的场景）。
+func TestDubboServicesForReconcileEnumOnly(t *testing.T) {
+	dirID := "dubbo/G1/c1->G2/d1/"
+	enumResult := []string{"providers:com.foo.Bar:1.0.0"}
+	e := &Engine{
+		dubboDisco: map[string]*discoState{
+			dirID: {lastAt: time.Now(), services: enumResult},
+		},
+	}
+	rd := &runningDir{
+		d:          &direction{ID: dirID, Dubbo: true},
+		registered: map[string]regEntry{},
+		failCount:  map[string]int{},
+		dead:       map[string]regEntry{},
+	}
+	got := e.dubboServicesForReconcile(context.Background(), rd)
+	if len(got) != 1 || got[0] != enumResult[0] {
+		t.Fatalf("dubboServicesForReconcile = %v, want %v (enum only when registered empty)", got, enumResult)
 	}
 }

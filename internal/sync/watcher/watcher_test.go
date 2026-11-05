@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -140,5 +141,23 @@ func TestStatusHealthyRequiresFreshLastOK(t *testing.T) {
 	st = w.Status()
 	if st[0].Healthy {
 		t.Fatalf("exited poller must be unhealthy; got %+v", st)
+	}
+}
+
+func TestPollerStopIsConcurrentAndIdempotent(t *testing.T) {
+	p := &poller{stopCh: make(chan struct{})}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.stop()
+		}()
+	}
+	wg.Wait()
+	select {
+	case <-p.stopCh:
+	default:
+		t.Fatal("stop must close the poller stop channel")
 	}
 }

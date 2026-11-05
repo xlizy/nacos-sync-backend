@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,7 @@ type Engine struct {
 	logger *zap.Logger
 
 	mu         sync.Mutex
+	forwardLocks [64]sync.Mutex // bounded striped locks serialize writes for the same config key
 	parentCtx  context.Context               // 引擎生命周期 ctx（Start 时设置），供 reconcile 启动新链路派生
 	stops      map[string]context.CancelFunc // linkKey -> 取消函数（link 级生命周期）
 	linkCtxs   map[string]context.Context    // linkKey -> 该 link 的 ctx（供各命名空间监听派生，stop 时整条链路取消）
@@ -268,7 +270,7 @@ func (e *Engine) watchNamespace(ctx context.Context, link config.SyncLink, names
 	const maxRetry = 5
 	var lastErr error
 	for attempt := 0; attempt < maxRetry; attempt++ {
-		src, items, err := e.setupWatch(ctx, link, namespace)
+		src, tgt, items, err := e.setupWatch(ctx, link, namespace)
 		if err != nil {
 			lastErr = err
 			e.logger.Warn("config watch namespace setup failed, retrying",
@@ -281,9 +283,15 @@ func (e *Engine) watchNamespace(ctx context.Context, link config.SyncLink, names
 			}
 			continue
 		}
-		// setup 成功：阻塞直到取消，再逐一撤销监听（释放 SDK 回调，防止泄露）。
-		<-ctx.Done()
+		// setup 成功后持续巡检命名空间配置集合。Nacos ListenConfig 是按
+		// DataId/Group 注册的，不会收到“新建了另一个 DataId”的通知；
+		// 因此必须重新枚举，才能发现运行期间新增的配置项。
+		watched := make(map[string]dataRef, len(items))
 		for _, it := range items {
+			watched[dataRefKey(it)] = it
+		}
+		e.monitorNamespaceWatches(ctx, link, namespace, src, tgt, watched)
+		for _, it := range watched {
 			_ = src.CancelListenConfig(vo.ConfigParam{DataId: it.DataId, Group: it.Group})
 		}
 		return nil
@@ -294,21 +302,108 @@ func (e *Engine) watchNamespace(ctx context.Context, link config.SyncLink, names
 	return lastErr
 }
 
+// monitorNamespaceWatches 定期重新枚举命名空间，动态增删具体 DataId/Group 监听。
+func (e *Engine) monitorNamespaceWatches(ctx context.Context, link config.SyncLink, namespace string, src, tgt config_client.IConfigClient, watched map[string]dataRef) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		items, err := e.enumerate(ctx, src)
+		if err != nil {
+			e.logger.Warn("config namespace rescan failed; existing listeners retained",
+				zap.String("link", linkKey(link)), zap.String("ns", namespace), zap.Error(err))
+			continue
+		}
+		desired := make(map[string]dataRef, len(items))
+		for _, it := range items {
+			desired[dataRefKey(it)] = it
+		}
+		for key, it := range watched {
+			if _, ok := desired[key]; ok {
+				continue
+			}
+			// SearchConfig no longer lists this item. Confirm with GetConfig before
+			// treating it as deleted, then explicitly fire the target-side delete
+			// before removing the listener. Otherwise a delayed source delete event
+			// could be lost if this rescan cancels the listener first.
+			content, getErr := src.GetConfig(vo.ConfigParam{DataId: it.DataId, Group: it.Group})
+			if getErr != nil {
+				e.logger.Warn("verify removed config failed; listener retained for retry",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(getErr))
+				continue
+			}
+			if content != "" {
+				continue // search pagination/race; source still has the config
+			}
+			if err := e.forward(ctx, link, namespace, it.Group, it.DataId, "", src, tgt); err != nil {
+				e.logger.Warn("propagate removed config failed; listener retained for retry",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(err))
+				continue
+			}
+			if err := src.CancelListenConfig(vo.ConfigParam{DataId: it.DataId, Group: it.Group}); err != nil {
+				e.logger.Warn("cancel removed config listener failed",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(err))
+			}
+			delete(watched, key)
+		}
+		for key, it := range desired {
+			if _, ok := watched[key]; ok {
+				continue
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			if err := src.ListenConfig(vo.ConfigParam{
+				DataId: it.DataId,
+				Group: it.Group,
+				OnChange: func(ns, group, dataId, data string) {
+					e.onChange(ctx, link, namespace, group, dataId, data, src, tgt)
+				},
+			}); err != nil {
+				e.logger.Warn("listen newly discovered config failed; will retry on next scan",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(err))
+				continue
+			}
+			// Listener is installed before the initial publish so changes during
+			// propagation are not silently missed. If propagation fails, remove
+			// the listener and retry both steps on the next scan.
+			if err := e.initialPropagate(ctx, link, namespace, it, src, tgt); err != nil {
+				_ = src.CancelListenConfig(vo.ConfigParam{DataId: it.DataId, Group: it.Group})
+				e.logger.Warn("initial propagate for newly discovered config failed; will retry",
+					zap.String("link", linkKey(link)), zap.String("ns", namespace),
+					zap.String("group", it.Group), zap.String("dataId", it.DataId), zap.Error(err))
+				continue
+			}
+			watched[key] = it
+		}
+	}
+}
+
+func dataRefKey(it dataRef) string { return it.Group + "\x00" + it.DataId }
+
 // setupWatch 完成单次监听建立（建连 + 枚举 + 初始点火 + 注册监听）。失败时返回错误，由 watchNamespace 重试。
 // 成功时回传源客户端与已注册监听的配置项，供调用方在取消时逐一撤销监听（释放 SDK 回调）。
-func (e *Engine) setupWatch(ctx context.Context, link config.SyncLink, namespace string) (config_client.IConfigClient, []dataRef, error) {
+func (e *Engine) setupWatch(ctx context.Context, link config.SyncLink, namespace string) (config_client.IConfigClient, config_client.IConfigClient, []dataRef, error) {
 	src, err := e.mgr.ConfigClient(link.From, namespace)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	tgt, err := e.mgr.ConfigClient(link.To, namespace)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	items, err := e.enumerate(ctx, src)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// 初始点火：把源集群当前配置推一次到目标，确保既有配置的客户端也被通知。
@@ -370,10 +465,10 @@ func (e *Engine) setupWatch(ctx context.Context, link config.SyncLink, namespace
 			e.logger.Error("listen config failed; rolled back partial listens",
 				zap.String("link", linkKey(link)), zap.String("ns", namespace),
 				zap.String("dataId", it.DataId), zap.Error(err))
-			return nil, nil, fmt.Errorf("listen config %s: %w", it.DataId, err)
+			return nil, nil, nil, fmt.Errorf("listen config %s: %w", it.DataId, err)
 		}
 	}
-	return src, items, nil
+	return src, tgt, items, nil
 }
 
 // initialPropagate 推送单个配置到目标以点燃其本地通知。冷却判定已上移到 setupWatch 批次级。
@@ -432,11 +527,22 @@ func (e *Engine) onChange(ctx context.Context, link config.SyncLink, ns, group, 
 }
 
 // forward 真正向目标发布（或删除）并记入回声表。
-// 失败时按指数退避重试（有界次数），且每次重试前**重新拉取源端最新内容**：
-// 集群共享同一 config DB，用事件时刻的旧内容重试可能把已被再次修改的 DB 值改回旧值。
-// 成功后 recordPush 内容以实际发布内容为准。返回最终错误供调用方聚合判断（此前静默失败
-// 会造成目标端长期不通知且无人知晓，P1「发布失败无重试」）。
+// 每次尝试（包括首次）都重新读取源端最新内容：监听回调经并发池异步执行，
+// 同一 DataId/Group 的旧事件可能晚于新事件执行，不能把回调 payload 当作当前值。
+// 失败时按指数退避重试（有界次数）；读取源端失败时绝不回退使用旧 payload。
+// 成功后 recordPush 内容以实际发布内容为准。返回最终错误供调用方聚合判断。
 func (e *Engine) forward(ctx context.Context, link config.SyncLink, ns, group, dataId, data string, src, tgt config_client.IConfigClient) error {
+	// Serialize all in-process writes for one logical config key. A fresh source
+	// read alone is insufficient: two tasks can read old/new values and publish
+	// them in reverse order. Fixed stripes bound memory; unrelated keys may
+	// occasionally serialize on a hash collision.
+	lockKey := pushKey(link.From, link.To, ns, group, dataId)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(lockKey))
+	lock := &e.forwardLocks[h.Sum32()%uint32(len(e.forwardLocks))]
+	lock.Lock()
+	defer lock.Unlock()
+
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -446,11 +552,26 @@ func (e *Engine) forward(ctx context.Context, link config.SyncLink, ns, group, d
 				return ctx.Err()
 			case <-time.After(time.Duration(attempt) * time.Second): // 1s、2s 退避
 			}
-			// 重试前重取源端最新内容：避免把过期内容写回共享 DB（见函数注释）。
-			if fresh, err := src.GetConfig(vo.ConfigParam{DataId: dataId, Group: group}); err == nil {
-				data = fresh
-			}
 		}
+		// Listener callbacks are submitted to a concurrent worker pool, so an older
+		// event can execute after a newer event for the same DataId/Group. Always
+		// re-read the authoritative source immediately before deciding what to write,
+		// including on the first attempt; never trust the callback payload as current.
+		fresh, err := src.GetConfig(vo.ConfigParam{DataId: dataId, Group: group})
+		if err != nil {
+			lastErr = fmt.Errorf("refresh source config before publish: %w", err)
+			e.logger.Warn("refresh source config before publish failed",
+				zap.String("link", linkKey(link)), zap.String("dataId", dataId),
+				zap.Int("attempt", attempt+1), zap.Error(err))
+			continue
+		}
+		data = fresh
+
+		// Do not skip publication merely because target content already matches.
+		// Nacos config storage may be shared while change notifications are local
+		// to each cluster; a write is still needed to ignite target-side listeners.
+		// Local echo suppression prevents the ordinary return path. Cross-worker
+		// duplicate writes remain possible without a distributed idempotency key.
 		start := time.Now()
 		if data == "" {
 			ok, err := tgt.DeleteConfig(vo.ConfigParam{DataId: dataId, Group: group})
@@ -517,14 +638,18 @@ func (e *Engine) isEcho(src, dst, ns, group, dataId, content string) bool {
 	}
 	rec := v.(pushRec)
 	if time.Since(rec.at) > echoTTL {
-		e.pushed.Delete(key)
+		// Delete only the exact record we inspected. A concurrent publish may
+		// already have replaced it with a newer echo for the same key.
+		e.pushed.CompareAndDelete(key, v)
 		return false
 	}
-	if rec.hash == hashContent(content) {
-		e.pushed.Delete(key)
-		return true
+	if rec.hash != hashContent(content) {
+		return false
 	}
-	return false
+	// Load+Delete is not an atomic consume: concurrent callbacks could both
+	// observe the same record and both suppress their events. CompareAndDelete
+	// makes consumption one-shot and cannot remove a newer replacement record.
+	return e.pushed.CompareAndDelete(key, v)
 }
 
 // gcEcho 周期性清理回声表中超过 echoTTL 的残留条目。回声表本就在 isEcho 命中时删除，

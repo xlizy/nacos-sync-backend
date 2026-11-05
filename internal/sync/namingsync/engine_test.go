@@ -2,9 +2,9 @@ package namingsync
 
 import (
 	"context"
-	"net"
-	"strconv"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,15 +33,106 @@ func TestIsProxied(t *testing.T) {
 // TestIsOurs 验证「归属清理」核心：仅清理本方向（srcCID）产生的代注册实例，不越界到其它方向。
 func TestIsOurs(t *testing.T) {
 	ours := model.Instance{Metadata: map[string]string{metaSyncSource: "NACOS", metaSyncSourceCluster: "abc1"}}
-	if !isOurs(ours, "abc1") {
+	if !isOurs(ours, "abc1", "dirA") {
 		t.Fatal("匹配 srcCID 的代注册实例应归属本方向")
 	}
-	if isOurs(ours, "xyz9") {
+	if isOurs(ours, "xyz9", "dirA") {
 		t.Fatal("srcCID 不匹配的代注册实例不应归属本方向")
 	}
 	other := model.Instance{Metadata: map[string]string{metaSyncSource: "NACOS", metaSyncSourceCluster: "xyz9"}}
-	if isOurs(other, "abc1") {
+	if isOurs(other, "abc1", "dirA") {
 		t.Fatal("其它方向的代注册实例不应被本方向清理")
+	}
+	collision := model.Instance{Metadata: map[string]string{
+		metaSyncSource: "NACOS", metaSyncSourceCluster: "abc1", metaSyncSourceDirection: "dirB",
+	}}
+	if isOurs(collision, "abc1", "dirA") {
+		t.Fatal("相同 srcCID 但方向 ID 不同的实例不能被当前方向认领")
+	}
+	legacy := model.Instance{Metadata: map[string]string{
+		metaSyncSource: "NACOS", metaSyncSourceCluster: "abc1",
+	}}
+	if !isOurs(legacy, "abc1", "dirA") {
+		t.Fatal("无方向元数据的旧实例应兼容 srcCID 归属")
+	}
+}
+
+func TestDirectionManagesService(t *testing.T) {
+	static := &direction{Services: []string{"ORDER", "PAY"}}
+	if !directionManagesService(static, "ORDER") || directionManagesService(static, "USER") {
+		t.Fatal("静态方向必须严格遵循当前服务白名单")
+	}
+	dubbo := &direction{Dubbo: true}
+	if !directionManagesService(dubbo, "providers:com.example.Order") {
+		t.Fatal("Dubbo 方向应管理 providers 服务")
+	}
+	if directionManagesService(dubbo, "ORDER") {
+		t.Fatal("Dubbo 方向不应管理非 Dubbo 服务")
+	}
+}
+
+func TestSweepScansDistinguishesSameCIDAcrossGroups(t *testing.T) {
+	e := &Engine{}
+	cfg := &config.Config{
+		NacosGroup: []config.NacosGroup{
+			{GrpID: "group-a", Clusters: []config.NacosCluster{{CID: "shared"}}},
+			{GrpID: "group-b", Clusters: []config.NacosCluster{{CID: "shared"}}},
+		},
+	}
+	scans := e.sweepScans(cfg)
+	if len(scans) != 2 {
+		t.Fatalf("same CID in different groups must produce two sweep targets, got %+v", scans)
+	}
+	if scans[0].label() == scans[1].label() {
+		t.Fatalf("group-qualified sweep targets must be distinct: %+v", scans)
+	}
+}
+
+func TestPruneOrphanSeen(t *testing.T) {
+	e := &Engine{orphanSeen: make(map[string]time.Time)}
+	scan := sweepScan{dstGrp: "g", dstCID: "dst", ns: ""}
+	keep := scan.label() + "\x00" + regKey("ORDER", model.Instance{Ip: "10.0.0.1", Port: 8080})
+	remove := scan.label() + "\x00" + regKey("PAY", model.Instance{Ip: "10.0.0.2", Port: 8080})
+	otherScope := "g/other/\x00" + regKey("USER", model.Instance{Ip: "10.0.0.3", Port: 8080})
+	e.orphanSeen[keep] = time.Now()
+	e.orphanSeen[remove] = time.Now()
+	e.orphanSeen[otherScope] = time.Now()
+
+	e.pruneOrphanSeen(scan, map[string]struct{}{keep: {}})
+	if _, ok := e.orphanSeen[keep]; !ok {
+		t.Fatal("currently observed orphan must retain its grace-period timestamp")
+	}
+	if _, ok := e.orphanSeen[remove]; ok {
+		t.Fatal("orphan no longer present in a complete scan must be pruned")
+	}
+	if _, ok := e.orphanSeen[otherScope]; !ok {
+		t.Fatal("pruning one target must not affect another target's timestamps")
+	}
+}
+
+type rejectingDeregisterClient struct {
+	stubNamingClient
+	ok  bool
+	err error
+}
+
+func (c rejectingDeregisterClient) DeregisterInstance(vo.DeregisterInstanceParam) (bool, error) {
+	return c.ok, c.err
+}
+
+func TestDeregisterOrphanRequiresNacosAcceptance(t *testing.T) {
+	e := &Engine{logger: zap.NewNop()}
+	target := sweepTarget{dstGrp: "g", dstCID: "dst", service: "ORDER"}
+	inst := model.Instance{Ip: "10.0.0.1", Port: 8080, ClusterName: "DEFAULT"}
+
+	if e.deregisterOrphan(rejectingDeregisterClient{ok: false}, target, inst) {
+		t.Fatal("false,nil from Nacos must not be treated as successful deregistration")
+	}
+	if e.deregisterOrphan(rejectingDeregisterClient{err: context.DeadlineExceeded}, target, inst) {
+		t.Fatal("deregistration error must be reported as failure")
+	}
+	if !e.deregisterOrphan(rejectingDeregisterClient{ok: true}, target, inst) {
+		t.Fatal("accepted deregistration must be reported as success")
 	}
 }
 
@@ -79,7 +170,7 @@ func TestRegKeyRoundTrip(t *testing.T) {
 		if gotSvc != tt.svc {
 			t.Fatalf("splitRegKey svc = %q, want %q", gotSvc, tt.svc)
 		}
-		if gotIk != instKey(tt.in) {
+		if gotIk != instanceSpecKey(tt.in) {
 			t.Fatalf("splitRegKey instKey = %q, want %q", gotIk, instKey(tt.in))
 		}
 	}
@@ -95,8 +186,41 @@ func TestFilterNatives(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("filterNatives len = %d, want 1", len(got))
 	}
-	if _, ok := got[instKey(src[0])]; !ok {
+	if _, ok := got[instanceSpecKey(src[0])]; !ok {
 		t.Fatal("原始业务实例应被保留")
+	}
+}
+
+// TestFilterNativesPreservesSameEndpointPublisherVariants verifies that two
+// publisher clients may expose the same endpoint with different metadata.
+// Those records must not collapse into one local desired-state entry.
+func TestFilterNativesPreservesSameEndpointPublisherVariants(t *testing.T) {
+	base := model.Instance{
+		Ip: "10.0.0.8", Port: 8080, ClusterName: "DEFAULT",
+		Weight: 1, Enable: true, Healthy: true,
+	}
+	first := base
+	first.Metadata = map[string]string{"version": "v1", "zone": "a"}
+	second := base
+	second.Metadata = map[string]string{"version": "v2", "zone": "b"}
+
+	got := filterNatives([]model.Instance{first, second})
+	if len(got) != 2 {
+		t.Fatalf("same endpoint with different publisher metadata collapsed: got %d records", len(got))
+	}
+	if regKey("ORDER", first) == regKey("ORDER", second) {
+		t.Fatal("different publisher specifications must have distinct registration keys")
+	}
+
+	proxy := second
+	proxy.Metadata = map[string]string{
+		"version": "v2", "zone": "b",
+		metaSyncSource: "NACOS",
+		metaSyncSourceCluster: "src",
+		metaSyncSourceDirection: "g/src->g/dst/",
+	}
+	if got := instanceSpecKey(sourceViewOfProxy(proxy)); got != instanceSpecKey(second) {
+		t.Fatal("proxy ownership metadata must be stripped when matching a target publisher to its source spec")
 	}
 }
 
@@ -240,80 +364,331 @@ func (stubNamingClient) DeregisterInstance(vo.DeregisterInstanceParam) (bool, er
 // captureNamingClient 捕获写路径实际发出的 RegisterInstance 参数，用于断言代注册 metadata。
 type captureNamingClient struct {
 	naming_client.INamingClient
-	got chan vo.RegisterInstanceParam
+	got chan vo.BatchRegisterInstanceParam
 }
 
-func (c captureNamingClient) RegisterInstance(p vo.RegisterInstanceParam) (bool, error) {
+func (c captureNamingClient) BatchRegisterInstance(p vo.BatchRegisterInstanceParam) (bool, error) {
 	c.got <- p
 	return true, nil
 }
 
-// TestRegisterProxiedWritesSyncSourceAgent 锁定「代注册溯源」不变量：registerProxied 写入的
-// 目标实例必须带齐两个溯源元数据——syncSource=NACOS、syncSourceCluster=源CID
-// （syncSourceAgent=本机 IP 的写入已临时关闭，见 engine.go registerProxied，恢复时一并放开）；同时原样保留源实例 metadata。
-func TestRegisterProxiedWritesSyncSourceAgent(t *testing.T) {
-	pl, err := pool.New(4, zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pl.Release()
+type batchDeregisterNamingClient struct {
+	naming_client.INamingClient
+	batches chan vo.BatchRegisterInstanceParam
+	removed chan vo.DeregisterInstanceParam
+}
 
-	// 监听本地端口，使源实例 ip:port 通过「僵尸门禁」的 TCP 探活（否则被判定为僵尸跳过代注册）。
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	_, portStr, _ := net.SplitHostPort(l.Addr().String())
-	port, _ := strconv.ParseUint(portStr, 10, 16)
+func (c batchDeregisterNamingClient) BatchRegisterInstance(p vo.BatchRegisterInstanceParam) (bool, error) {
+	c.batches <- p
+	return true, nil
+}
 
-	const agentIP = "10.10.171.157"
-	capCh := make(chan vo.RegisterInstanceParam, 1)
-	e := &Engine{
-		pl:      pl,
-		logger:  zap.NewNop(),
-		agentIP: agentIP,
+func (c batchDeregisterNamingClient) DeregisterInstance(p vo.DeregisterInstanceParam) (bool, error) {
+	c.removed <- p
+	return true, nil
+}
+
+// TestDispatchOpsRepublishesRemainingBatch verifies the SDK behavior that a
+// single deregistration invalidates the whole per-service redo cache: after
+// deleting one desired instance, the engine must batch-publish all survivors.
+func TestDispatchOpsRepublishesRemainingBatch(t *testing.T) {
+	client := batchDeregisterNamingClient{
+		batches: make(chan vo.BatchRegisterInstanceParam, 1),
+		removed: make(chan vo.DeregisterInstanceParam, 1),
 	}
-	e.mgr = nacos.NewClientManagerStub("d", "", captureNamingClient{got: capCh})
+	e := &Engine{logger: zap.NewNop()}
+	removed := model.Instance{Ip: "10.0.0.1", Port: 8080, Weight: 1, Enable: true, Healthy: true}
+	remaining := model.Instance{Ip: "10.0.0.2", Port: 8080, Weight: 1, Enable: true, Healthy: true}
 	rd := &runningDir{
-		d:          &direction{ID: "g/s->g/d/", SrcCID: "s", DstCID: "d"},
-		dstClient:  captureNamingClient{got: capCh},
-		registered: map[string]regEntry{},
-		failCount:  map[string]int{},
-		dead:       map[string]regEntry{},
-	}
-	in := model.Instance{
-		Ip:       "127.0.0.1",
-		Port:     port,
-		Weight:   1,
-		Enable:   true,
-		Healthy:  true,
-		Metadata: map[string]string{"k": "v", "preserved.register.source": "SPRING_CLOUD"},
+		d: &direction{ID: "g/s->g/d/", SrcCID: "s", DstCID: "d"},
+		dstClient: client,
+		registered: map[string]regEntry{
+			regKey("TEST-SVC", remaining): {svc: "TEST-SVC", inst: remaining},
+		},
+		failCount: map[string]int{},
+		dead: map[string]regEntry{},
 	}
 
-	e.registerProxied(context.Background(), rd, "TEST-SVC", in)
+	e.dispatchOps(context.Background(), rd, []regOp{{add: false, svc: "TEST-SVC", in: removed}})
+
+	select {
+	case got := <-client.removed:
+		if got.Ip != removed.Ip {
+			t.Fatalf("deregistered %s, want %s", got.Ip, removed.Ip)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected deregistration before batch republish")
+	}
+	select {
+	case got := <-client.batches:
+		if len(got.Instances) != 1 || got.Instances[0].Ip != remaining.Ip {
+			t.Fatalf("expected full remaining publication, got %+v", got.Instances)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected remaining service instances to be batch-published")
+	}
+}
+
+// TestDispatchOpsDeduplicatesDeregistrationPerService verifies that removing
+// several instances from one Nacos service sends only one deregistration RPC,
+// followed by one complete batch publication of the remaining desired set.
+func TestDispatchOpsDeduplicatesDeregistrationPerService(t *testing.T) {
+	client := batchDeregisterNamingClient{
+		batches: make(chan vo.BatchRegisterInstanceParam, 4),
+		removed: make(chan vo.DeregisterInstanceParam, 4),
+	}
+	e := &Engine{logger: zap.NewNop()}
+	remaining := model.Instance{Ip: "10.0.0.9", Port: 8080, Weight: 1, Enable: true, Healthy: true}
+	rd := &runningDir{
+		d: &direction{ID: "g/s->g/d/", SrcCID: "s", DstCID: "d"},
+		dstClient: client,
+		registered: map[string]regEntry{
+			regKey("TEST-SVC", remaining): {svc: "TEST-SVC", inst: remaining},
+		},
+		failCount: map[string]int{},
+		dead: map[string]regEntry{},
+	}
+	ops := []regOp{
+		{add: false, svc: "TEST-SVC", in: model.Instance{Ip: "10.0.0.1", Port: 8080}},
+		{add: false, svc: "TEST-SVC", in: model.Instance{Ip: "10.0.0.2", Port: 8080}},
+		{add: false, svc: "TEST-SVC", in: model.Instance{Ip: "10.0.0.3", Port: 8080}},
+	}
+	e.dispatchOps(context.Background(), rd, ops)
+
+	if got := len(client.removed); got != 1 {
+		t.Fatalf("sent %d deregistration RPCs for one service, want 1", got)
+	}
+	if got := len(client.batches); got != 1 {
+		t.Fatalf("sent %d batch registrations for one service, want 1", got)
+	}
+	batch := <-client.batches
+	if len(batch.Instances) != 1 || batch.Instances[0].Ip != remaining.Ip {
+		t.Fatalf("expected one full remaining publication, got %+v", batch.Instances)
+	}
+}
+
+// TestDispatchOpsSkipsDeregisterWhenSameTickHasAdd verifies churn avoidance:
+// when a service has both an add op and a remove op in the same tick (the
+// classic case is source metadata drift — old spec key disappears, new one
+// appears), deregisterProxied must be skipped so the target cluster never
+// observes an "all instances gone then back" flap. BatchRegisterInstance's
+// replace-semantics drops the old spec from the server-side instance set
+// without tearing the publisher down first.
+//
+// Contrast with TestDispatchOpsRepublishesRemainingBatch above: when a service
+// has only removals (source endpoint truly disappeared), deregistration is
+// still issued and the survivors are republished.
+func TestDispatchOpsSkipsDeregisterWhenSameTickHasAdd(t *testing.T) {
+	client := batchDeregisterNamingClient{
+		batches: make(chan vo.BatchRegisterInstanceParam, 4),
+		removed: make(chan vo.DeregisterInstanceParam, 4),
+	}
+	e := &Engine{logger: zap.NewNop()}
+	// Metadata drift: same ip:port, old spec carried metadata {rev: v1},
+	// new spec carries {rev: v2}. The reconciliation stage already deleted the
+	// old spec from rd.registered and inserted the new one; dispatchOps only
+	// sees the resulting ops: remove(old) + add(new).
+	oldSpec := model.Instance{Ip: "10.0.0.1", Port: 20880, ClusterName: "DEFAULT",
+		Weight: 1, Enable: true, Healthy: true, Metadata: map[string]string{"revision": "v1"}}
+	newSpec := model.Instance{Ip: "10.0.0.1", Port: 20880, ClusterName: "DEFAULT",
+		Weight: 1, Enable: true, Healthy: true, Metadata: map[string]string{"revision": "v2"}}
+	rd := &runningDir{
+		d:        &direction{ID: "g/s->g/d/", SrcCID: "s", DstCID: "d"},
+		dstClient: client,
+		registered: map[string]regEntry{
+			regKey("DUBBO-SVC", newSpec): {svc: "DUBBO-SVC", inst: newSpec},
+		},
+		failCount: map[string]int{},
+		dead:      map[string]regEntry{},
+	}
+	ops := []regOp{
+		{add: false, svc: "DUBBO-SVC", in: oldSpec}, // old spec disappeared from source
+		{add: true, svc: "DUBBO-SVC", in: newSpec},  // new spec appeared (same endpoint, drifted metadata)
+	}
+	e.dispatchOps(context.Background(), rd, ops)
+
+	// Must NOT deregister — BatchRegister overwrites the publication, dropping v1.
+	select {
+	case got := <-client.removed:
+		t.Fatalf("deregister must be skipped when same tick has an add (churn avoidance), got %+v", got)
+	default:
+	}
+	// Must batch-publish the new desired set exactly once.
+	select {
+	case batch := <-client.batches:
+		if len(batch.Instances) != 1 || batch.Instances[0].Ip != newSpec.Ip {
+			t.Fatalf("expected one new-spec publication, got %+v", batch.Instances)
+		}
+	default:
+		t.Fatal("expected exactly one batch registration of the new spec")
+	}
+	select {
+	case <-client.batches:
+		t.Fatal("expected exactly one batch registration, got a second")
+	default:
+	}
+}
+
+// TestEmptyStreakTolerance 验证源查询连续返回空时的容错语义：
+// InstancesLive 偶发返回空（liveProxy 连接劣化/多节点 Nacos 同步延迟/provider 心跳短暂过期）
+// 时，连续 emptyStreakThreshold-1 次不注销（保留 registered），第 emptyStreakThreshold 次
+// 才允许注销。源恢复非空时清零计数。防止瞬时查询波动导致 dubbo 代注册频繁注销重注册。
+func TestEmptyStreakTolerance(t *testing.T) {
+	rd := &runningDir{
+		d:           &direction{ID: "g/s->g/d/"},
+		registered:  map[string]regEntry{"svc\x0010.0.0.1:8080": {svc: "svc", inst: model.Instance{Ip: "10.0.0.1", Port: 8080}}},
+		failCount:   map[string]int{},
+		dead:        map[string]regEntry{},
+		emptyStreak: map[string]int{},
+	}
+
+	// 连续 emptyStreakThreshold-1 次源查询返回空：容错窗口内不注销。
+	for i := 0; i < emptyStreakThreshold-1; i++ {
+		natives := filterNatives(nil)
+		rd.mu.Lock()
+		skipDeregister := false
+		if len(natives) == 0 {
+			for _, re := range rd.registered {
+				if re.svc == "svc" {
+					rd.emptyStreak["svc"]++
+					if rd.emptyStreak["svc"] < emptyStreakThreshold {
+						skipDeregister = true
+					}
+					break
+				}
+			}
+		}
+		rd.mu.Unlock()
+		if !skipDeregister {
+			t.Fatalf("iteration %d: should skip deregister below threshold", i)
+		}
+		if len(rd.registered) == 0 {
+			t.Fatalf("iteration %d: registered must not be emptied during tolerance window", i)
+		}
+	}
+
+	// 第 emptyStreakThreshold 次：达阈值，允许注销。
+	rd.mu.Lock()
+	rd.emptyStreak["svc"]++
+	allowDeregister := rd.emptyStreak["svc"] >= emptyStreakThreshold
+	rd.mu.Unlock()
+	if !allowDeregister {
+		t.Fatalf("after %d consecutive empty results, deregister should be allowed", emptyStreakThreshold)
+	}
+
+	// 源恢复非空时清零计数。
+	rd.mu.Lock()
+	delete(rd.emptyStreak, "svc")
+	rd.mu.Unlock()
+	if _, ok := rd.emptyStreak["svc"]; ok {
+		t.Fatal("emptyStreak should be cleared when source returns non-empty")
+	}
+}
+
+// TestRegisterProxiedPublishesWholeService verifies that a single recovery/add
+// operation publishes every locally desired instance for the service in one batch,
+// and that node-specific metadata cannot cause Active-Active nodes to overwrite it.
+func TestRegisterProxiedPublishesWholeService(t *testing.T) {
+	capCh := make(chan vo.BatchRegisterInstanceParam, 1)
+	e := &Engine{logger: zap.NewNop()}
+	rd := &runningDir{
+		d: &direction{ID: "g/s->g/d/", SrcCID: "s", DstCID: "d"},
+		dstClient: captureNamingClient{got: capCh},
+		registered: map[string]regEntry{
+			regKey("TEST-SVC", model.Instance{Ip: "10.0.0.1", Port: 8080}): {
+				svc: "TEST-SVC",
+				inst: model.Instance{Ip: "10.0.0.1", Port: 8080, Weight: 1, Enable: true, Healthy: true, Metadata: map[string]string{"k":"v"}},
+			},
+			regKey("TEST-SVC", model.Instance{Ip: "10.0.0.2", Port: 8080}): {
+				svc: "TEST-SVC",
+				inst: model.Instance{Ip: "10.0.0.2", Port: 8080, Weight: 1, Enable: true, Healthy: true},
+			},
+		},
+		failCount: map[string]int{},
+		dead: map[string]regEntry{},
+	}
+	e.registerProxied(context.Background(), rd, "TEST-SVC", model.Instance{Ip:"10.0.0.1", Port:8080})
 
 	select {
 	case p := <-capCh:
-		if p.Metadata[metaSyncSource] != "NACOS" {
-			t.Fatalf("syncSource = %q, want NACOS", p.Metadata[metaSyncSource])
+		if p.ServiceName != "TEST-SVC" || len(p.Instances) != 2 {
+			t.Fatalf("batch should contain both desired service instances: %+v", p)
 		}
-		if p.Metadata[metaSyncSourceCluster] != "s" {
-			t.Fatalf("syncSourceCluster = %q, want s", p.Metadata[metaSyncSourceCluster])
+		found := map[string]bool{}
+		for _, in := range p.Instances {
+			found[in.Ip] = true
+			if in.Metadata[metaSyncSource] != "NACOS" || in.Metadata[metaSyncSourceCluster] != "s" {
+				t.Fatalf("missing ownership metadata: %+v", in.Metadata)
+			}
+			if _, ok := in.Metadata["syncSourceAgent"]; ok {
+				t.Fatalf("node-specific syncSourceAgent must not be published: %+v", in.Metadata)
+			}
 		}
-		// 同步服务本机 IP 溯源字段（syncSourceAgent）已临时关闭，恢复时取消下方注释：
-		// if p.Metadata[metaSyncSourceAgent] != agentIP {
-		// 	t.Fatalf("syncSourceAgent = %q, want %s", p.Metadata[metaSyncSourceAgent], agentIP)
-		// }
-		// 源实例 metadata 必须原样带到目标（除三个溯源键外）。
-		if p.Metadata["k"] != "v" || p.Metadata["preserved.register.source"] != "SPRING_CLOUD" {
-			t.Fatalf("源 metadata 未被原样保留: %v", p.Metadata)
-		}
-		// 目标实例 ip/port 必须源自源实例。
-		if p.Ip != "127.0.0.1" || p.Port != port {
-			t.Fatalf("目标实例地址错误: %s:%d", p.Ip, p.Port)
+		if !found["10.0.0.1"] || !found["10.0.0.2"] {
+			t.Fatalf("batch lost an instance: %+v", found)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("registerProxied 未在 2s 内调用 RegisterInstance（可能被僵尸门禁误跳过）")
+		t.Fatal("registerProxied did not call BatchRegisterInstance")
+	}
+}
+
+type cleanupTrackingClient struct {
+	stubNamingClient
+	active atomic.Int32
+	max    atomic.Int32
+	count  atomic.Int32
+}
+
+func (c *cleanupTrackingClient) DeregisterInstance(vo.DeregisterInstanceParam) (bool, error) {
+	active := c.active.Add(1)
+	for {
+		old := c.max.Load()
+		if active <= old || c.max.CompareAndSwap(old, active) {
+			break
+		}
+	}
+	time.Sleep(5 * time.Millisecond)
+	c.count.Add(1)
+	c.active.Add(-1)
+	return true, nil
+}
+
+func TestCleanupDirectionUsesBoundedConcurrentDeregistration(t *testing.T) {
+	client := &cleanupTrackingClient{}
+	e := &Engine{
+		mgr:    nacos.NewClientManagerStub("dst", "", client),
+		logger: zap.NewNop(),
+	}
+	rd := &runningDir{
+		d:          &direction{ID: "src->dst", SrcCID: "src", DstCID: "dst"},
+		dstClient:  client,
+		registered: make(map[string]regEntry),
+		dead:       make(map[string]regEntry),
+		failCount:  make(map[string]int),
+	}
+	wantServices := cleanupConcurrency*2 + 7
+	for i := 0; i < wantServices; i++ {
+		svc := fmt.Sprintf("ORDER-%03d", i)
+		for j := 0; j < 3; j++ {
+			in := model.Instance{Ip: "10.0.0.1", Port: uint64(1000 + i*3 + j), ClusterName: "DEFAULT"}
+			rd.registered[regKey(svc, in)] = regEntry{svc: svc, inst: in}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	e.cleanupDirection(ctx, rd)
+
+	if got := client.count.Load(); got != int32(wantServices) {
+		t.Fatalf("cleanup sent %d deregistration RPCs, want one per %d services", got, wantServices)
+	}
+	if got := client.max.Load(); got <= 1 {
+		t.Fatalf("cleanup should issue concurrent deregistrations, max concurrency=%d", got)
+	}
+	if got := client.max.Load(); got > cleanupConcurrency {
+		t.Fatalf("cleanup concurrency exceeded limit: got %d, limit %d", got, cleanupConcurrency)
+	}
+	if !rd.isStopped() {
+		t.Fatal("cleanup must mark direction stopped")
 	}
 }

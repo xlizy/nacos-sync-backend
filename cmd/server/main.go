@@ -85,6 +85,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Active-Active：每个实例都启动完整同步引擎与 watcher。
+	// 多实例通过 Worker 心跳协同维护方向，不进行 Leader 选举或主备切换。
 	cfgEngine.Start(ctx)
 	nameEngine.Start(ctx)
 	syncWatcher.Start(ctx)
@@ -114,7 +116,7 @@ func main() {
 		}
 	}
 
-	// 启动后向 Nacos 注册中心注册自身（reg-namespace + appname），进程退出时注销。
+	// 每个 Active 实例都向 Nacos 注册中心登记自身（reg-namespace + appname），退出时注销。
 	deregister, rerr := registry.Register(ctx, boot, api.DefaultHTTPPort, logger)
 	if rerr != nil {
 		logger.Warn("service registration init failed", zap.Error(rerr))

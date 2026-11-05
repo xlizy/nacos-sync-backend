@@ -21,7 +21,7 @@ internal/nacos        ClientManager（(clusterID, namespace) 缓存 SDK 客户�
                       + localCache admin 刷新 + 分组 MySQL 指纹（config_info/gray）+ 连通性/鉴权探测
 internal/sync/configsync   new↔new 配置同步：监听点火 + 回声抑制（sha256，30s TTL）+ patrol/reconcile 自愈
 internal/sync/namingsync   服务同步（代注册）：ephemeral + syncSource 元数据防回环，
-                           1s 源实例快轮询 + TCP 探活 + 10s 全量对账 + 20s 孤儿清扫；
+                           1s Nacos 源实例快轮询 + 10s 全量对账 + 20s 孤儿清扫；
                            dubbo 动态方向：按 providers:/consumers: 前缀实时枚举源集群服务全量代注册
 internal/sync/watcher      配置同步辅助：3s 轮询目标 Nacos 后端 MySQL 指纹，变化刷新各节点 localCache
 internal/api          Hertz 控制面（组/集群 CRUD、同步开关、状态查询、按 IP 查服务、reload/reencrypt）
@@ -34,8 +34,10 @@ configs/runtime-config.example.yaml  运行时配置 schema 示例（实际存�
 
 ## 运行
 ```bash
-# 后端（引导配置指定去哪连配置中心；运行时配置从配置中心拉取并热更新）
+# 每个节点均以 Active-Active 模式启动完整同步能力
 go run ./cmd/server -c configs/config.yaml
+
+# 其它节点使用相同运行方式和运行时同步拓扑
 NACOS_SYNC_CONFIG=/path/to/config.yaml ./nacos-sync
 
 # 必需环境变量
@@ -44,6 +46,17 @@ export NACOS_SYNC_SECRET_KEY=...   # ENC(...) 加解密主密钥（引导配置 
 export NACOS_SYNC_JWT_SECRET=...   # JWT 签名密钥（缺省回退 secret-key）
 export NACOS_SYNC_API_TOKEN=...    # 静态共享令牌（机器/脚本旁路鉴权）
 ```
+
+## 多节点部署与 Worker 心跳
+
+系统只支持 **Active-Active** 部署：
+
+- 每个实例启动 ConfigSync、NamingSync 和 watcher，并参与配置中启用的同步方向。
+- 多个实例可以同时运行相同拓扑、同时维护相同方向；不进行 Leader 选举，不使用主备切换，也没有自动 promote。
+- 每个实例针对每条目标方向，在目标 Nacos 的 `NACOS-SYNC-WORKER` 服务中登记独立的 ephemeral Worker 心跳。
+- Worker 心跳用于方向存活发现和孤儿保护，不是选主、分布式锁或 fencing。若其他 Worker 仍存活，某实例停止时不会主动注销该方向的共享代注册实例。
+- 所有实例均提供完整控制面；写操作由任一实例处理后，通过配置中心热更新同步拓扑。多实例部署应使用一致的引导配置、运行时配置和认证密钥。
+- 节点故障后，其它 Active 实例继续工作；故障节点恢复后重新登记 Worker 并参与同步。Worker 心跳不替代 Nacos 集群自身的可用性与网络隔离机制。
 
 ## 控制面 API（9696）
 

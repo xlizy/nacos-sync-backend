@@ -50,6 +50,7 @@ type poller struct {
 	done       chan struct{}
 	ctx        context.Context
 	cancel     context.CancelFunc
+	stopOnce   sync.Once
 	mu         sync.Mutex
 	lastOK     time.Time
 	lastDigest string
@@ -57,13 +58,17 @@ type poller struct {
 
 // Manager 配置同步轮询管理器。
 type Manager struct {
-	mgr     *config.Manager
-	logger  *zap.Logger
-	mu      sync.Mutex
-	pollers map[string]*poller
+	mgr         *config.Manager
+	logger      *zap.Logger
+	mu          sync.Mutex
+	pollers     map[string]*poller
 
 	// refresh 可在测试中替换（依赖注入）；生产路径为 refreshGroup。
 	refresh func(grpID string) error
+
+	reconcileMu sync.Mutex // 串行化 reconcile 与 shutdown
+	started     bool
+	stopped     bool
 }
 
 // New 构造。
@@ -81,6 +86,14 @@ func (w *Manager) doRefresh(grpID string) error {
 
 // Start 启动：初始 reconcile + 注册配置变更 reconcile + 启动巡检 goroutine。
 func (w *Manager) Start(ctx context.Context) {
+	w.reconcileMu.Lock()
+	if w.started {
+		w.reconcileMu.Unlock()
+		return
+	}
+	w.started = true
+	w.reconcileMu.Unlock()
+
 	w.reconcile(w.mgr.Get())
 	w.mgr.OnRuntimeChange(func(c *config.Config) {
 		w.reconcile(c)
@@ -119,12 +132,19 @@ func (w *Manager) desired(cfg *config.Config) map[string]config.NacosGroup {
 // 与所有 reconcile），本函数只在 w.mu 下做「停旧 + 收集待建列表」的轻量操作；实际的 DB 建连
 // （可能慢/不可达）移到锁外执行，建好后再加锁安装。
 func (w *Manager) reconcile(cfg *config.Config) {
+	w.reconcileMu.Lock()
+	defer w.reconcileMu.Unlock()
+	if w.stopped {
+		return
+	}
+
 	desired := w.desired(cfg)
 	w.mu.Lock()
-	// 停掉不再需要的。
+	// 收集需停止的 poller，关闭 DB 连接放到 w.mu 外执行。
+	var toStop []*poller
 	for id, p := range w.pollers {
 		if _, ok := desired[id]; !ok {
-			p.stop()
+			toStop = append(toStop, p)
 			delete(w.pollers, id)
 		}
 	}
@@ -147,12 +167,16 @@ func (w *Manager) reconcile(cfg *config.Config) {
 		}
 		if restart {
 			if ok {
-				p.stop() // 关闭旧连接（异常终止时可能仍占着，安全关闭）
+				toStop = append(toStop, p) // 旧连接稍后在锁外关闭
+				delete(w.pollers, id)
 			}
 			toStart = append(toStart, g)
 		}
 	}
 	w.mu.Unlock()
+	for _, p := range toStop {
+		p.stop()
+	}
 
 	if len(toStart) == 0 {
 		return
@@ -162,15 +186,31 @@ func (w *Manager) reconcile(cfg *config.Config) {
 	for _, g := range toStart {
 		started[g.GrpID] = w.newPoller(g)
 	}
-	// 重新加锁安装；若并发 reconcile 已为该分组创建了新 poller，则丢弃本次新建（避免重复/泄漏）。
+	// DB 建连期间配置可能已再次变化。必须以 Manager 当前配置复核，而不能只相信
+	// 本次 reconcile 的旧快照；否则旧 DSN 的慢建连可能在新 DSN 已安装后反向覆盖它。
+	currentDesired := w.desired(w.mgr.Get())
 	w.mu.Lock()
 	for id, p := range started {
+		g, stillDesired := currentDesired[id]
+		if !stillDesired || g.DBDSN != p.dsn {
+			toStop = append(toStop, p)
+			continue
+		}
 		if existing, ok := w.pollers[id]; ok {
-			existing.stop()
+			// reconcileMu 保证不会有另一个 reconcile 并发安装；若仍存在，
+			// 同 DSN 保留现有 poller，不同 DSN 则替换并在锁外停止旧实例。
+			if existing.dsn == p.dsn {
+				toStop = append(toStop, p)
+				continue
+			}
+			toStop = append(toStop, existing)
 		}
 		w.pollers[id] = p
 	}
 	w.mu.Unlock()
+	for _, p := range toStop {
+		p.stop()
+	}
 }
 
 // newPoller 建连并启动轮询 goroutine；建连失败则标记异常终止，交由巡检重建。
@@ -305,27 +345,32 @@ func (w *Manager) refreshGroup(grpID string) error {
 
 // stop 幂等停止：关闭 stop 信号、取消 ctx（中断在途 DB 查询）与 DB 连接（连接关闭可能短暂阻塞，但不在锁内）。
 func (p *poller) stop() {
-	select {
-	case <-p.stopCh:
-		return // 已关闭
-	default:
+	p.stopOnce.Do(func() {
 		close(p.stopCh)
-	}
-	if p.cancel != nil {
-		p.cancel()
-	}
-	if p.db != nil {
-		_ = p.db.Close()
-	}
+		if p.cancel != nil {
+			p.cancel()
+		}
+		if p.db != nil {
+			_ = p.db.Close()
+		}
+	})
 }
 
-// stopAll 全部停止（ctx 取消时）。
+// stopAll 全部停止（ctx 取消时）。与 reconcile 串行化，且禁止 shutdown 后的配置回调重建 poller。
 func (w *Manager) stopAll() {
+	w.reconcileMu.Lock()
+	w.stopped = true
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	pollers := make([]*poller, 0, len(w.pollers))
 	for id, p := range w.pollers {
-		p.stop()
+		pollers = append(pollers, p)
 		delete(w.pollers, id)
+	}
+	w.mu.Unlock()
+	w.reconcileMu.Unlock()
+
+	for _, p := range pollers {
+		p.stop()
 	}
 }
 
@@ -355,7 +400,7 @@ func (w *Manager) Status() []PollerStatus {
 				}
 			}
 		}
-		if p.lastOK.IsZero() {
+		if lastOK.IsZero() {
 			st.LastOK = ""
 		}
 		out = append(out, st)

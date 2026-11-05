@@ -60,8 +60,7 @@ type Server struct {
 }
 
 // New 构造、设监听端口并注册路由（不立即监听）。
-// 控制面鉴权：若环境变量 NACOS_SYNC_API_TOKEN 已设置，则对所有非只读接口强制
-// `Authorization: Bearer <token>`；未设置则关闭鉴权（开发/内网默认，避免破坏现有调用）。
+// 所有实例均运行完整控制面；多实例部署采用 Active-Active。
 func New(mgr *config.Manager, clientMgr *nacos.ClientManager, cfgEngine *configsync.Engine, nameEngine *namingsync.Engine, wk *watcher.Manager, logger *zap.Logger) *Server {
 	h := server.New(server.WithHostPorts(fmt.Sprintf(":%d", DefaultHTTPPort)))
 

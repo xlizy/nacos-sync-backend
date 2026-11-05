@@ -35,7 +35,7 @@ func TestProbeRecoversDeadInstance(t *testing.T) {
 	_, portStr, _ := net.SplitHostPort(l.Addr().String())
 	port, _ := strconv.ParseUint(portStr, 10, 16)
 
-	capCh := make(chan vo.RegisterInstanceParam, 1)
+	capCh := make(chan vo.BatchRegisterInstanceParam, 1)
 	e := &Engine{
 		pl:       pl,
 		logger:   zap.NewNop(),
@@ -57,8 +57,8 @@ func TestProbeRecoversDeadInstance(t *testing.T) {
 
 	select {
 	case p := <-capCh:
-		if p.Ip != "127.0.0.1" || p.Port != port {
-			t.Fatalf("代注册目标地址错误: %s:%d", p.Ip, p.Port)
+		if len(p.Instances) != 1 || p.Instances[0].Ip != "127.0.0.1" || p.Instances[0].Port != port {
+			t.Fatalf("代注册目标地址错误: %+v", p.Instances)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("dead 假死恢复应在 2s 内触发代注册")
