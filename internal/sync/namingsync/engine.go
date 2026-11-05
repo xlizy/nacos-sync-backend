@@ -1038,6 +1038,13 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 					e.clearOrphanSeen(s, svc, inst)
 					continue
 				}
+				// Ephemeral instances are owned by the gRPC connection that published them.
+				// This sweep client cannot deregister another connection's publication;
+				// closing the owning connection removes it automatically. Never report a
+				// successful cleanup for a foreign ephemeral publication.
+				if inst.Ephemeral {
+					continue
+				}
 				// 多节点滚动更新与候选过期都有短暂窗口：必须连续观察到无全局 owner 并超过宽限期才删。
 				if !e.orphanReady(s, svc, inst) {
 					continue
