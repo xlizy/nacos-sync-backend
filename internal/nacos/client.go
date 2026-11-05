@@ -504,6 +504,10 @@ func isConnError(err error) bool {
 		strings.Contains(msg, "Connection refused")
 }
 
+// IsConnectionError exposes the SDK connection-failure classifier to sync engines
+// so dedicated clients can be rebuilt instead of remaining permanently unhealthy.
+func IsConnectionError(err error) bool { return isConnError(err) }
+
 // invalidateLiveProxy 关闭并移除指定 (clusterID, namespace) 的实时查询客户端缓存，
 // 使下次 InstancesLive 强制重建一条全新 gRPC 连接。用于连接层故障（节点重启/UNHEALTHY）的
 // 即时自愈：无需等待 liveProxyTTL，下一次快轮询（≤ sourcePollInterval）即拿到新连接。
