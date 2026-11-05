@@ -169,16 +169,15 @@ type runningDir struct {
 	emptyStreak map[string]int     // 各 svc 源实例列表连续返回空的次数（容错：达 emptyStreakThreshold 才注销），key=svc
 	stopped    bool                // 方向已停止（准备/正在清理）：此后拒绝新的代注册，防清理后残留
 
-	// dstClient 本方向专属的目标集群命名客户端（gRPC 连接），不进入 ClientManager 的共享缓存。
-	// 由本方向独占：ephemeral 代注册实例绑定在该连接上，方向停止时 CloseClient 销毁连接与 SDK 注册缓存，
-	// 令服务端随连接关闭一并回收这些实例，且断线重连不会把已下线实例自动重声明回去。
-	// 相较共享缓存客户端：共享客户端被其它方向复用、不能随单方向停止而关闭，且其 registeredInstanceCached
-	// 在连接重连时会被 SDK 自动重注册（见 connection_event_listener.redoRegisterEachService），正是「禁用同步后代注册实例下不了线」的根因。
-	clientMu     sync.Mutex
-	dstClient    naming_client.INamingClient
+	// instanceClients 按 regKey 保存每个实例独占的 ephemeral 发布连接。
+	// SDK v2.3.5 的 redo cache 以 service 为键，同一客户端重复 RegisterInstance 会覆盖前一实例。
+	clientMu        sync.Mutex
+	instanceClients map[string]naming_client.INamingClient
+	// dstClient 仅供旧测试替身注入；生产方向不设置共享客户端。
+	dstClient     naming_client.INamingClient
 	workerClient naming_client.INamingClient // 独立于数据客户端的方向存活登记连接
-	workerDead   atomic.Bool // 任一方向协程异常退出；reconcile 据此重启整个方向
-	republishAll atomic.Bool // 目标写连接重建后，本方向全部服务都需要重新发布
+	workerDead   atomic.Bool
+	republishAll atomic.Bool
 }
 
 // isStopped 报告该方向是否已被停止（准备/正在清理）。
@@ -457,9 +456,9 @@ func (e *Engine) refreshRunningDirection(d *direction) {
 	if len(removed) > 0 {
 		e.logger.Info("direction service list changed, cleaning removed services",
 			zap.String("dir", d.ID), zap.Int("count", len(removed)))
-		for _, re := range removed {
-			e.deregisterProxied(e.ctx, rd, re.svc, re.inst)
-		}
+		ops := make([]regOp, 0, len(removed))
+		for _, re := range removed { ops = append(ops, regOp{add:false, svc:re.svc, in:re.inst}) }
+		e.dispatchOps(e.ctx, rd, ops)
 	}
 }
 
@@ -649,25 +648,15 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 	e.stops[d.ID] = cancel
 	e.mu.Unlock()
 
-	// 为本方向构建「专属」目标集群客户端（不进共享缓存）。该客户端由本方向独占：
-	// ephemeral 代注册实例绑定在此连接上，方向停止时 CloseClient 会断开连接、清空 SDK 注册缓存，
-	// 令服务端随连接关闭一并回收这些实例，且断线重连不会把已下线实例自动重声明回去——
-	// 这正是「禁用同步后代注册实例下不了线」的根因所在（共享客户端会在重连时 redoRegisterEachService）。
-	// 绑定失败即放弃本方向、等待下次 reconcile 重试。
-	dstCli, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
-	if err != nil {
-		e.setErr(d.ID, err)
-		e.stopDir(d.ID)
-		return
-	}
-
+	// 目标写客户端按实例惰性创建：每个实例一个独立 ephemeral gRPC 发布连接，
+	// 避免 SDK v2.3.5 按 service 覆盖 redo cache 导致断线重连只恢复最后一个实例。
 	rd := &runningDir{
-		d:          d,
-		dstClient:  dstCli,
-		registered:  make(map[string]regEntry),
-		failCount:   make(map[string]int),
-		dead:        make(map[string]regEntry),
-		emptyStreak: make(map[string]int),
+		d:               d,
+		instanceClients: make(map[string]naming_client.INamingClient),
+		registered:      make(map[string]regEntry),
+		failCount:       make(map[string]int),
+		dead:            make(map[string]regEntry),
+		emptyStreak:     make(map[string]int),
 	}
 	e.mu.Lock()
 	e.runs[d.ID] = rd
@@ -837,92 +826,26 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 	rd.mu.Unlock()
 
 	rd.clientMu.Lock()
-	client := rd.dstClient
-	rd.clientMu.Unlock()
-	defer func() {
-		rd.clientMu.Lock()
-		c := rd.dstClient
+	clients := make([]naming_client.INamingClient, 0, len(rd.instanceClients)+1)
+	for _, client := range rd.instanceClients {
+		if client != nil { clients = append(clients, client) }
+	}
+	rd.instanceClients = make(map[string]naming_client.INamingClient)
+	if rd.dstClient != nil {
+		clients = append(clients, rd.dstClient) // 兼容旧测试替身
 		rd.dstClient = nil
-		rd.clientMu.Unlock()
-		if c != nil {
-			e.mgr.CloseDedicatedNamingClient(c)
-		}
-	}()
-	if client == nil || len(entries) == 0 {
-		return
 	}
+	rd.clientMu.Unlock()
 
-	// 若另一个节点仍维护该方向，本节点只能关闭自己的 ephemeral 连接，不能主动注销共享实例。
-	// 查询失败也采取保守策略：跳过主动注销，避免把其他节点仍在维护的实例误删。
-	otherWorker := false
-	if e.worker != nil {
-		workers, err := e.mgr.InstancesLive(d.DstCID, d.Namespace, nacos.WorkerService, defaultGroup)
-		if err != nil {
-			e.logger.Warn("cleanup direction: query Worker heartbeats failed; skip deregistration",
-				zap.String("dir", d.ID), zap.Error(err))
-				return
-		}
-		otherWorker = nacos.HasOtherWorker(workers, d.ID, e.worker)
-	}
-	if otherWorker {
-		e.logger.Info("cleanup direction: another Worker still maintains direction; close only this node's connection",
-			zap.String("dir", d.ID))
+	e.logger.Info("cleanup direction: closing per-instance publishers",
+		zap.String("dir", d.ID), zap.Int("clients", len(clients)), zap.Int("instances", len(entries)))
+	for _, client := range clients {
+		if ctx.Err() != nil {
+			e.logger.Warn("cleanup direction timed out; remaining ephemeral publishers will be closed on process exit", zap.String("dir", d.ID))
 			return
+		}
+		if e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
 	}
-
-	// Nacos v2 的连接客户端对每个 (namespace, group, service) 只保存一个 publisher；
-	// BatchRegisterInstance 把该 publisher 设为完整实例集合，而服务端 DeregisterInstance
-	// 会直接 removeServiceInstance(service)，即一次注销会移除本连接该服务的整份发布集合。
-	// 因此这里必须按服务去重，不能对同一服务的每个实例重复发送注销 RPC。
-	services := make([]regEntry, 0)
-	seenServices := make(map[string]struct{}, len(entries))
-	for _, re := range entries {
-		if _, ok := seenServices[re.svc]; ok {
-			continue
-		}
-		seenServices[re.svc] = struct{}{}
-		services = append(services, re) // SDK request still carries a representative instance identity
-	}
-	e.logger.Info("cleanup direction: deregistering proxied services",
-		zap.String("dir", d.ID), zap.Int("services", len(services)), zap.Int("instances", len(entries)))
-
-	// 有界并发按服务执行注销：大量实例属于同一服务时只需一个 RPC；多个服务仍分批并发。
-	for start := 0; start < len(services); start += cleanupConcurrency {
-		select {
-		case <-ctx.Done():
-			e.logger.Warn("cleanup deregister aborted by timeout, some services may linger", zap.String("dir", d.ID))
-			return
-		default:
-		}
-		end := start + cleanupConcurrency
-		if end > len(services) {
-			end = len(services)
-		}
-		var batch sync.WaitGroup
-		for _, entry := range services[start:end] {
-			re := entry
-			batch.Add(1)
-			go func() {
-				defer batch.Done()
-				ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
-					ServiceName: re.svc, GroupName: defaultGroup, Ip: re.inst.Ip, Port: re.inst.Port,
-					Ephemeral: true, Cluster: re.inst.ClusterName,
-				})
-				if err == nil && !ok {
-					err = fmt.Errorf("nacos rejected cleanup deregister")
-				}
-				if err != nil {
-					e.logger.Error("cleanup deregister proxied service failed", zap.String("dir", d.ID), zap.String("svc", re.svc), zap.Error(err))
-					metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
-					return
-				}
-				e.logger.Info("cleanup deregister proxied service ok", zap.String("dir", d.ID), zap.String("svc", re.svc))
-			}()
-		}
-		batch.Wait()
-	}
-
-	
 }
 
 // sweepTarget 孤儿清扫目标：目标集群 + 命名空间 + 服务。
@@ -1526,45 +1449,49 @@ type regOp struct {
 	in  model.Instance
 }
 
-// dispatchOps 按收集顺序串行执行一批代注册/注销网络操作。必须在**未持有 rd.mu** 时调用
-// （任务体内部需要 rd.mu）；调用方（fastPoll/syncService）持 rd.opMu，保证写序稳定。
+// dispatchOps 将本轮实例级注册/注销操作提交到协程池，并等待本轮任务完成。
+// 调用方持有 rd.opMu，确保不同 tick 的写操作不会乱序；不同实例之间可并发执行。
+// 空实例（forceRepublish 标记）展开为该服务当前全部 desired 实例。
 func (e *Engine) dispatchOps(ctx context.Context, rd *runningDir, ops []regOp) {
-	// SDK v2.3.5 keeps one redo-publication per (group, service) and
-	// BatchRegisterInstance replaces that publication with the full instance set.
-	// Server-side deregistration removes this connection's whole publisher for
-	// the service, so collapse any number of instance removals into one RPC and
-	// republish the complete remaining desired set once.
-	//
-	// Churn avoidance: when a service has both an add op and a remove op in the
-	// same tick (the classic case is source metadata drift — the old spec key
-	// disappears from natives and a new one appears), skip deregisterProxied
-	// and let registerServiceProxied's BatchRegisterInstance overwrite the full
-	// publication. BatchRegister is replace-semantics: the old spec is dropped
-	// from the server-side instance set without the publisher being torn down
-	// first, so the target cluster never observes an "all instances gone then
-	// back" flap. Deregistration is still issued when a service has only
-	// removals (the source endpoint truly disappeared); the subsequent
-	// republish restores whatever remains in the desired set.
-	touched := make(map[string]struct{})
-	hasAdd := make(map[string]bool)
-	removals := make(map[string]regOp)
+	type task struct { add bool; svc string; in model.Instance }
+	tasks := make([]task, 0, len(ops))
+	seen := make(map[string]struct{}, len(ops))
 	for _, op := range ops {
-		touched[op.svc] = struct{}{}
-		if op.add {
-			hasAdd[op.svc] = true
-		} else if _, exists := removals[op.svc]; !exists {
-			removals[op.svc] = op
+		if op.add && op.in.Ip == "" && op.in.Port == 0 {
+			rd.mu.Lock()
+			for rk, re := range rd.registered {
+				if re.svc != op.svc { continue }
+				key := "true:" + rk
+				if _, ok := seen[key]; ok { continue }
+				seen[key] = struct{}{}
+				tasks = append(tasks, task{add:true, svc:re.svc, in:re.inst})
+			}
+			rd.mu.Unlock()
+			continue
+		}
+		rk := regKey(op.svc, op.in)
+		key := fmt.Sprintf("%t:%s", op.add, rk)
+		if _, ok := seen[key]; ok { continue }
+		seen[key] = struct{}{}
+		tasks = append(tasks, task{add:op.add, svc:op.svc, in:op.in})
+	}
+	var wg sync.WaitGroup
+	for _, item := range tasks {
+		item := item
+		wg.Add(1)
+		run := func(taskCtx context.Context) {
+			defer wg.Done()
+			if taskCtx.Err() != nil { return }
+			if item.add { e.registerProxied(taskCtx, rd, item.svc, item.in) } else { e.deregisterProxied(taskCtx, rd, item.svc, item.in) }
+		}
+		if e.pl == nil { run(ctx); continue }
+		if err := e.pl.Submit(ctx, run); err != nil {
+			wg.Done()
+			e.logger.Error("submit per-instance naming operation failed", zap.String("dir", rd.direction().ID), zap.String("svc", item.svc), zap.Error(err))
+			e.setErr(rd.direction().ID, err)
 		}
 	}
-	for svc, op := range removals {
-		if hasAdd[svc] {
-			continue // 同 tick 有注册：BatchRegister 覆盖语义会移除旧 spec，跳过注销避免 churn。
-		}
-		e.deregisterProxied(ctx, rd, svc, op.in)
-	}
-	for svc := range touched {
-		e.registerServiceProxied(ctx, rd, svc)
-	}
+	wg.Wait()
 }
 
 // syncService ③ 全量兜底对账：拉源实例 → 过滤代注册 → 与真实目标对账（幂等补/清）。
@@ -1780,7 +1707,7 @@ func (e *Engine) probe(ctx context.Context, rd *runningDir) {
 						rd.registered[rk] = re
 					}
 					rd.mu.Unlock()
-					e.registerProxied(ctx, rd, re.svc, re.inst)
+					e.dispatchOps(ctx, rd, []regOp{{add:true, svc:re.svc, in:re.inst}})
 					return
 				}
 			}
@@ -1874,189 +1801,100 @@ func (e *Engine) ensureWorker(rd *runningDir) (bool, error) {
 	return true, nil
 }
 
-// dstClient 取得向目标集群写实例的客户端——即本方向【专属】的命名客户端（见 runningDir.dstClient）。
-// 该客户端在 startDirection 时构建、方向停止时 CloseClient 销毁，由本方向独占，不进入共享缓存，
-// 因此关闭它不会误伤其它方向；而代注册的 ephemeral 实例随连接关闭被服务端回收、且不会在重连时被 SDK 自动重声明。
-// 写失败自愈由 rebuildDstClient 负责（关闭旧连接、新建本方向专属连接），而非失效共享缓存。
-func (e *Engine) dstClient(rd *runningDir) (naming_client.INamingClient, error) {
-	rd.clientMu.Lock()
-	c := rd.dstClient
-	rd.clientMu.Unlock()
-	if c != nil {
-		return c, nil
-	}
-
-	// A previous rebuild may have failed after closing the old client. Do not
-	// leave the direction permanently wedged on a nil pointer: retry creation
-	// on the next write attempt and mark the whole direction dirty.
-	d := rd.direction()
-	nc, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
-	if err != nil {
-		rd.republishAll.Store(true) // retry client creation on the next fast poll
-		return nil, fmt.Errorf("rebuild destination client for direction %s: %w", d.ID, err)
-	}
-	rd.clientMu.Lock()
-	if rd.dstClient == nil {
-		rd.dstClient = nc
-		c = nc
-		rd.republishAll.Store(true)
-	} else {
-		c = rd.dstClient
-	}
-	rd.clientMu.Unlock()
-	if c != nc {
-		e.mgr.CloseDedicatedNamingClient(nc)
-	}
-	return c, nil
-}
-
-// rebuildDstClient 本方向写操作遭遇连接层故障时，重建本方向专属目标客户端（关闭旧连接、新建连接）。
-// 仅影响本方向：旧客户端被关闭即销毁其 registeredInstanceCached，新客户端独立，不会误伤其它方向的目标连接。
-func (e *Engine) rebuildDstClient(rd *runningDir) {
-	// Callers hold rd.opMu, so no direction write can race this replacement.
-	rd.clientMu.Lock()
-	old := rd.dstClient
-	rd.dstClient = nil
-	rd.clientMu.Unlock()
-	if old != nil {
-		e.mgr.CloseDedicatedNamingClient(old)
-	}
-
-	d := rd.direction()
-	nc, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
-	if err != nil {
-		e.logger.Error("rebuild direction dst client failed", zap.String("dir", d.ID), zap.Error(err))
-		// Keep republishAll set. dstClient() will retry construction on the next
-		// operation, and the successful retry will republish every service.
-		rd.republishAll.Store(true)
-		return
-	}
-	rd.clientMu.Lock()
-	rd.dstClient = nc
-	rd.clientMu.Unlock()
-	// Closing the old connection removes every ephemeral publication owned by
-	// it, not merely the instance whose write failed.
-	rd.republishAll.Store(true)
-}
-
-// registerProxied 向目标集群发起代注册（临时实例 ephemeral=true，走 gRPC，Nacos 3.x 支持）。
-// 注意：Nacos 3.x 已移除持久实例的 HTTP 写接口，SDK 持久实例注册会被 501 拒绝，故必须用 ephemeral。
-// 生命周期通过本服务的 Nacos 实时快轮询与周期全量对账管理：源实例消失即 DeregisterInstance 注销。
-func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string, _ model.Instance) {
-	// Recovery paths also publish the complete service snapshot.
-	e.registerServiceProxied(ctx, rd, svc)
-}
-
-// registerServiceProxied publishes the complete desired ephemeral instance set
-// for one service. SDK v2.3.5 caches registrations by service; repeated
-// RegisterInstance calls overwrite that cache, so a reconnect would restore
-// only the last instance. BatchRegisterInstance stores the complete set.
-func (e *Engine) registerServiceProxied(ctx context.Context, rd *runningDir, svc string) {
-	if ctx.Err() != nil {
-		return
-	}
+// registerProxied 为单个源实例建立独立 ephemeral 发布连接并注册到目标集群。
+// 每个客户端只发布一个实例，保证 nacos-sdk-go v2.3.5 的 service 级 redo cache 不会互相覆盖。
+func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
+	if ctx.Err() != nil { return }
+	rk := regKey(svc, in)
 	rd.mu.Lock()
-	if rd.stopped {
-		rd.mu.Unlock()
-		return
-	}
+	if rd.stopped { rd.mu.Unlock(); return }
 	d := rd.d
-	instances := make([]vo.RegisterInstanceParam, 0)
-	for _, re := range rd.registered {
-		if re.svc != svc {
-			continue
-		}
-		in := re.inst
-		instances = append(instances, vo.RegisterInstanceParam{
-			ServiceName: svc, GroupName: defaultGroup,
-			Ip: in.Ip, Port: in.Port, Weight: in.Weight,
-			Enable: in.Enable, Healthy: in.Healthy, Ephemeral: true,
-			Metadata: e.proxiedMetadata(d, in), ClusterName: in.ClusterName,
-		})
-	}
 	rd.mu.Unlock()
 
-	// The preceding deregistration already removed the SDK redo cache. An
-	// empty desired set needs no batch request (the SDK rejects empty batches).
-	if len(instances) == 0 {
-		return
-	}
-	client, err := e.dstClient(rd)
-	if err != nil {
-		e.setErr(d.ID, err)
-		return
-	}
-	ok, err := client.BatchRegisterInstance(vo.BatchRegisterInstanceParam{
-		ServiceName: svc, GroupName: defaultGroup, Instances: instances,
-	})
-	if err == nil && !ok {
-		err = fmt.Errorf("nacos rejected batch register instances")
-	}
-	if err != nil {
-		// Roll back this service's local desired snapshot so the next fast poll
-		// reconstructs it from the source and retries the entire batch.
-		rd.mu.Lock()
-		for rk, re := range rd.registered {
-			if re.svc == svc {
-				delete(rd.registered, rk)
-				rd.failCount[rk]++
+	rd.clientMu.Lock()
+	client := rd.instanceClients[rk]
+	legacyClient := rd.dstClient
+	rd.clientMu.Unlock()
+
+	created := false
+	if client == nil {
+		if legacyClient != nil {
+			client = legacyClient
+		} else {
+			if e.mgr == nil { e.setErr(d.ID, fmt.Errorf("nacos client manager is nil")); return }
+			nc, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
+			if err != nil {
+				err = fmt.Errorf("build per-instance destination client dir=%q service=%q instance=%q: %w", d.ID, svc, instKey(in), err)
+				e.setErr(d.ID, err)
+				metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
+				return
 			}
+			client, created = nc, true
 		}
-		rd.mu.Unlock()
+	}
+
+	ok, err := client.RegisterInstance(vo.RegisterInstanceParam{
+		ServiceName: svc, GroupName: defaultGroup,
+		Ip: in.Ip, Port: in.Port, Weight: in.Weight,
+		Enable: in.Enable, Healthy: in.Healthy, Ephemeral: true,
+		Metadata: e.proxiedMetadata(d, in), ClusterName: in.ClusterName,
+	})
+	if err == nil && !ok { err = fmt.Errorf("nacos rejected register instance") }
+	if err != nil {
+		err = fmt.Errorf("register proxied instance failed target_cluster=%q namespace=%q service=%q group=%q instance=%s: %w",
+			d.DstCID, d.Namespace, svc, defaultGroup, instKey(in), err)
+		if created && e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
+		rd.clientMu.Lock()
+		if rd.instanceClients[rk] == client { delete(rd.instanceClients, rk) }
+		rd.clientMu.Unlock()
+		rd.mu.Lock(); rd.failCount[rk]++; rd.mu.Unlock()
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 		e.setErr(d.ID, err)
-		e.logger.Error("batch register proxied failed",
-			zap.String("dir", d.ID), zap.String("svc", svc),
-			zap.Int("instances", len(instances)), zap.Error(err))
-		e.rebuildDstClient(rd)
+		e.logger.Error("register proxied instance failed", zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)), zap.Error(err))
 		return
 	}
-	rd.mu.Lock()
-	for _, p := range instances {
-		delete(rd.failCount, regKey(svc, model.Instance{Ip: p.Ip, Port: p.Port, ClusterName: p.ClusterName}))
+
+	if created {
+		rd.clientMu.Lock()
+		rd.mu.Lock(); stopped := rd.stopped; rd.mu.Unlock()
+		if !stopped { rd.instanceClients[rk] = client; client = nil }
+		rd.clientMu.Unlock()
+		if client != nil && e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
 	}
-	rd.mu.Unlock()
-	e.logger.Info("batch register proxied ok",
-		zap.String("dir", d.ID), zap.String("svc", svc), zap.Int("instances", len(instances)))
+	rd.mu.Lock(); delete(rd.failCount, rk); rd.mu.Unlock()
+	e.logger.Debug("register proxied instance ok", zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)))
 	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 }
-// deregisterProxied 从目标集群注销本方向的代注册实例（源已消失/崩溃时调用）。
+
+// deregisterProxied 通过关闭该实例独占的 gRPC 客户端注销 ephemeral 实例。
+// 不调用 SDK DeregisterInstance：其服务端语义是删除该客户端对整个 service 的 publisher。
 func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
-	if ctx.Err() != nil {
-		return
-	}
+	if ctx.Err() != nil { return }
 	d := rd.direction()
-	client, cerr := e.dstClient(rd)
-	if cerr != nil {
-		e.logger.Error("deregister proxied: get dst client failed",
-			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)), zap.Error(cerr))
-		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
-		e.setErr(d.ID, cerr)
+	rk := regKey(svc, in)
+	rd.clientMu.Lock()
+	client := rd.instanceClients[rk]
+	delete(rd.instanceClients, rk)
+	legacyClient := rd.dstClient
+	rd.clientMu.Unlock()
+	if client != nil {
+		if e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
+		e.logger.Debug("deregister proxied instance by closing publisher", zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)))
+		metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 		return
 	}
-	ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
-		ServiceName: svc,
-		GroupName:   defaultGroup,
-		Ip:          in.Ip,
-		Port:        in.Port,
-		Ephemeral:   true, // 必须与注册时一致（均为 ephemeral，走 gRPC）；Nacos 3.x 不支持实例 HTTP OpenAPI（501）。
-		Cluster:     in.ClusterName,
-	})
-	if err == nil && !ok {
-		err = fmt.Errorf("nacos rejected deregister instance")
+	// 仅供旧单元测试替身兼容；生产路径不会设置 legacyClient。
+	if legacyClient != nil {
+		ok, err := legacyClient.DeregisterInstance(vo.DeregisterInstanceParam{
+			ServiceName: svc, GroupName: defaultGroup, Ip: in.Ip, Port: in.Port, Ephemeral: true, Cluster: in.ClusterName,
+		})
+		if err == nil && !ok { err = fmt.Errorf("nacos rejected deregister instance") }
+		if err != nil {
+			e.setErr(d.ID, err)
+			e.logger.Error("deregister proxied failed", zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)), zap.Error(err))
+			metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
+		}
 	}
-	if err != nil {
-		e.setErr(d.ID, err)
-		e.logger.Error("deregister proxied failed",
-			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)), zap.Error(err))
-		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
-		// 目标集群节点重启等连接层故障：重建本方向专属目标客户端（关闭旧连接、新建连接），下次写操作即自愈。
-		e.rebuildDstClient(rd)
-		return
-	}
-	e.logger.Info("deregister proxied ok",
-		zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)))
-	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 }
 
 func (e *Engine) setOK(id string) {
