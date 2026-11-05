@@ -811,6 +811,22 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 	rd.opMu.Lock()
 	defer rd.opMu.Unlock()
 
+	// Worker heartbeat remains visible throughout data-plane cleanup and is withdrawn last.
+	defer func() {
+		rd.clientMu.Lock()
+		workerClient := rd.workerClient
+		rd.workerClient = nil
+		rd.clientMu.Unlock()
+		if e.worker != nil && workerClient != nil {
+			if err := e.worker.Leave(workerClient, d.ID); err != nil {
+				e.logger.Warn("leave naming worker heartbeat failed", zap.String("dir", d.ID), zap.Error(err))
+			}
+		}
+		if workerClient != nil {
+			e.mgr.CloseDedicatedNamingClient(workerClient)
+		}
+	}()
+
 	rd.mu.Lock()
 	rd.stopped = true // 先置停止标记：此后在途/新提交的代注册任务一律跳过，避免清理后又被注册回来
 	entries := make([]regEntry, 0, len(rd.registered)+len(rd.dead))
@@ -838,9 +854,28 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 			e.mgr.CloseDedicatedNamingClient(c)
 		}
 	}()
-	if client == nil {
+	if client == nil || len(entries) == 0 {
 		return
 	}
+
+	// 若另一个节点仍维护该方向，本节点只能关闭自己的 ephemeral 连接，不能主动注销共享实例。
+	// 查询失败也采取保守策略：跳过主动注销，避免把其他节点仍在维护的实例误删。
+	otherWorker := false
+	if e.worker != nil {
+		workers, err := e.mgr.InstancesLive(d.DstCID, d.Namespace, nacos.WorkerService, defaultGroup)
+		if err != nil {
+			e.logger.Warn("cleanup direction: query Worker heartbeats failed; skip deregistration",
+				zap.String("dir", d.ID), zap.Error(err))
+				return
+		}
+		otherWorker = nacos.HasOtherWorker(workers, d.ID, e.worker)
+	}
+	if otherWorker {
+		e.logger.Info("cleanup direction: another Worker still maintains direction; close only this node's connection",
+			zap.String("dir", d.ID))
+			return
+	}
+
 	e.logger.Info("cleanup direction: deregistering proxied instances",
 		zap.String("dir", d.ID), zap.Int("count", len(entries)))
 
