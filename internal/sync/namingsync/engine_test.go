@@ -2,6 +2,7 @@ package namingsync
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -479,7 +480,8 @@ func TestCleanupDirectionUsesBoundedConcurrentDeregistration(t *testing.T) {
 	want := cleanupConcurrency*2 + 7
 	for i := 0; i < want; i++ {
 		in := model.Instance{Ip: "10.0.0.1", Port: uint64(1000 + i), ClusterName: "DEFAULT"}
-		rd.registered[regKey("ORDER", in)] = regEntry{svc: "ORDER", inst: in}
+		svc := fmt.Sprintf("ORDER-%03d", i)
+		rd.registered[regKey(svc, in)] = regEntry{svc: svc, inst: in}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
