@@ -106,9 +106,7 @@ type Engine struct {
 	pl     *pool.Pool
 	logger *zap.Logger
 
-	agentIP   string
-	agentPort uint64
-	leader    *nacos.DirectionLeader
+	worker *nacos.DirectionWorker
 
 	orphanMu   sync.Mutex
 	orphanSeen map[string]time.Time // 首次确认无全局 owner 的时刻；宽限期后才允许删除
@@ -121,9 +119,6 @@ type Engine struct {
 	runs     map[string]*runningDir // 运行时状态（订阅/探活/已代注册集合），与 dirs 平行
 	lastSync map[string]time.Time
 	lastErr  map[string]string
-	// lastLeader 本节点当前是否为该方向的写主（多节点部署下非主节点不执行写对账，
-	// LastSync 停更属正常待命；此字段供 /api/naming-sync 区分「待命」与「卡死」）。
-	lastLeader map[string]bool
 	// 可观测性（gauge）：当前方向已跟踪的源实例数，与当前已在目标代注册（存活）的实例数。
 	lastSrcCount map[string]int
 	lastRegCount map[string]int
@@ -182,7 +177,7 @@ type discoState struct {
 type runningDir struct {
 	d *direction
 
-	// opMu 串行化本方向的选主、源目标读取和写操作，禁止快轮询/慢对账/清理交叉执行。
+	// opMu 串行化本方向的源目标读取和写操作，禁止快轮询/慢对账/清理交叉执行。
 	// 所有写操作同步完成，彻底避免共享协程池导致的“旧注册晚于新注销落地”。
 	opMu       sync.Mutex
 	mu         sync.Mutex
@@ -196,9 +191,10 @@ type runningDir struct {
 	// 令服务端随连接关闭一并回收这些实例，且断线重连不会把已下线实例自动重声明回去。
 	// 相较共享缓存客户端：共享客户端被其它方向复用、不能随单方向停止而关闭，且其 registeredInstanceCached
 	// 在连接重连时会被 SDK 自动重注册（见 connection_event_listener.redoRegisterEachService），正是「禁用同步后代注册实例下不了线」的根因。
-	clientMu   sync.Mutex
-	dstClient  naming_client.INamingClient
-	workerDead atomic.Bool // 任一方向协程异常退出；reconcile 据此重启整个方向
+	clientMu     sync.Mutex
+	dstClient    naming_client.INamingClient
+	workerClient naming_client.INamingClient // 独立于数据客户端的方向存活登记连接
+	workerDead   atomic.Bool // 任一方向协程异常退出；reconcile 据此重启整个方向
 }
 
 // isStopped 报告该方向是否已被停止（准备/正在清理）。
@@ -244,16 +240,13 @@ func New(conf *config.Manager, mgr *nacos.ClientManager, pl *pool.Pool, agentPor
 		mgr:          mgr,
 		pl:           pl,
 		logger:       logger,
-		agentIP:      agentIP,
-		agentPort:    agentPort,
-		leader:       nacos.NewDirectionLeader(mgr, agentIP, agentPort),
+		worker:       nacos.NewDirectionWorker(mgr, agentIP, agentPort),
 		orphanSeen:   make(map[string]time.Time),
 		stops:        make(map[string]context.CancelFunc),
 		dirs:         make(map[string]*direction),
 		runs:         make(map[string]*runningDir),
 		lastSync:     make(map[string]time.Time),
 		lastErr:      make(map[string]string),
-		lastLeader:   make(map[string]bool),
 		lastSrcCount: make(map[string]int),
 		lastRegCount: make(map[string]int),
 		probeSem:     make(chan struct{}, probeConcurrency),
@@ -413,7 +406,6 @@ func (e *Engine) reconcile(cfg *config.Config) {
 		e.mu.Lock()
 		delete(e.lastSync, it.id)
 		delete(e.lastErr, it.id)
-		delete(e.lastLeader, it.id)
 		delete(e.lastSrcCount, it.id)
 		delete(e.lastRegCount, it.id)
 		delete(e.dubboDisco, it.id) // 方向已停，枚举缓存一并释放
@@ -690,6 +682,26 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 	e.runs[d.ID] = rd
 	e.mu.Unlock()
 
+	// Worker 心跳使用独立连接，不与数据面目标客户端共享生命周期。
+	workerCli, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
+	if err != nil {
+		e.mgr.CloseDedicatedNamingClient(dstCli)
+		e.setErr(d.ID, fmt.Errorf("build worker heartbeat client: %w", err))
+		e.stopDir(d.ID)
+		return
+	}
+	rd.workerClient = workerCli
+	if e.worker != nil {
+		if err := e.worker.Ensure(workerCli, d.DstCID, d.Namespace, d.ID); err != nil {
+			e.mgr.CloseDedicatedNamingClient(workerCli)
+			e.mgr.CloseDedicatedNamingClient(dstCli)
+			rd.workerClient = nil
+			e.setErr(d.ID, fmt.Errorf("register worker heartbeat: %w", err))
+			e.stopDir(d.ID)
+			return
+		}
+	}
+
 	// 初始全量对账：立即把已存在实例代注册出去。
 	e.syncService(ctx, rd)
 
@@ -829,15 +841,6 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 	if client == nil {
 		return
 	}
-	if e.leader != nil {
-		if err := e.leader.Leave(client, d.ID); err != nil {
-			e.logger.Warn("leave sync leader failed", zap.String("dir", d.ID), zap.Error(err))
-		}
-	}
-
-	if len(entries) == 0 {
-		return
-	}
 	e.logger.Info("cleanup direction: deregistering proxied instances",
 		zap.String("dir", d.ID), zap.Int("count", len(entries)))
 
@@ -863,6 +866,20 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 			continue
 		}
 		e.logger.Info("cleanup deregister proxied ok", zap.String("dir", d.ID), zap.String("svc", re.svc), zap.String("inst", instKey(re.inst)))
+	}
+
+	// 数据面清理完成后才撤销 Worker 心跳，避免清理期间被其他节点判为孤儿。
+	rd.clientMu.Lock()
+	workerClient := rd.workerClient
+	rd.workerClient = nil
+	rd.clientMu.Unlock()
+	if e.worker != nil && workerClient != nil {
+		if err := e.worker.Leave(workerClient, d.ID); err != nil {
+			e.logger.Warn("leave naming worker heartbeat failed", zap.String("dir", d.ID), zap.Error(err))
+		}
+	}
+	if workerClient != nil {
+		e.mgr.CloseDedicatedNamingClient(workerClient)
 	}
 }
 
@@ -981,32 +998,19 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 			return
 		default:
 		}
-		// 一个目标集群用一个专属客户端：先参与清扫选主，再枚举并执行注销。
+		// 一个目标集群用一个专属客户端枚举实例并执行孤儿清理；清扫不参与选举。
 		cli, err := e.mgr.BuildDedicatedNamingClient(s.dstCID, s.ns)
 		if err != nil {
 			e.logger.Warn("orphan sweep: build client failed", zap.String("target", s.label()), zap.Error(err))
 			continue
 		}
-		scope := "sweep|" + s.label()
-		if e.leader != nil {
-			isLeader, lerr := e.leader.Ensure(cli, s.dstCID, s.ns, scope)
-			if lerr != nil {
-				e.logger.Warn("orphan sweep: leader check failed", zap.String("target", s.label()), zap.Error(lerr))
-				e.mgr.CloseDedicatedNamingClient(cli)
-				continue
-			}
-			if !isLeader {
-				e.mgr.CloseDedicatedNamingClient(cli)
-				continue
-			}
-		}
-		leaderInstances, err := e.mgr.InstancesLive(s.dstCID, s.ns, nacos.LeaderService, defaultGroup)
+		workerInstances, err := e.mgr.InstancesLive(s.dstCID, s.ns, nacos.WorkerService, defaultGroup)
 		if err != nil {
-			e.logger.Warn("orphan sweep: query active directions failed", zap.String("target", s.label()), zap.Error(err))
+			e.logger.Warn("orphan sweep: query active Worker heartbeats failed", zap.String("target", s.label()), zap.Error(err))
 			e.mgr.CloseDedicatedNamingClient(cli)
-			continue
+			continue // 存活登记查询失败必须 fail-closed：本轮不清理任何实例
 		}
-		activeDirections := nacos.ActiveScopes(leaderInstances)
+		activeDirections := nacos.WorkerScopes(workerInstances)
 		names, err := listServiceNames(cli, s.ns)
 		if err != nil {
 			e.logger.Warn("orphan sweep: list services failed", zap.String("target", s.label()), zap.Error(err))
@@ -1398,12 +1402,12 @@ func (e *Engine) fastPoll(ctx context.Context, rd *runningDir) {
 		return // 方向已停止，不再读写状态（避免清理后又写入/注册）
 	}
 	d := rd.direction()
-	leader, err := e.ensureWriteLeader(rd)
+	workerReady, err := e.ensureWorker(rd)
 	if err != nil {
 		e.setErr(d.ID, err)
 		return
 	}
-	if !leader {
+	if !workerReady {
 		return
 	}
 
@@ -1525,12 +1529,12 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 		return // 方向已停止，不再读写状态（避免清理后又写入/注册）
 	}
 	d := rd.direction()
-	leader, err := e.ensureWriteLeader(rd)
+	workerReady, err := e.ensureWorker(rd)
 	if err != nil {
 		e.setErr(d.ID, err)
 		return
 	}
-	if !leader {
+	if !workerReady {
 		return
 	}
 	// failed 记录本轮是否出现过取数/对账失败：失败时不能用 setOK 覆盖错误，
@@ -1666,7 +1670,7 @@ func (e *Engine) probe(ctx context.Context, rd *runningDir) {
 	}
 	// 仅快照 dead 集合：registered 存活实例不参与探活（结果无决策作用，纯 TCP 开销）。
 	// dead 常规恒为空（崩溃判定已移除）：先快照再查 leader，空集合直接返回，
-	// 省掉每 1s tick 一次的选主查询（InstancesLive）。
+	// 省掉每 1s tick 一次的Worker 心跳查询（InstancesLive）。
 	rd.mu.Lock()
 	if len(rd.dead) == 0 {
 		rd.mu.Unlock()
@@ -1678,7 +1682,7 @@ func (e *Engine) probe(ctx context.Context, rd *runningDir) {
 	}
 	rd.mu.Unlock()
 
-	leader, err := e.ensureWriteLeader(rd)
+	workerReady, err := e.ensureWorker(rd)
 	if err != nil || !leader {
 		if err != nil {
 			e.setErr(rd.direction().ID, err)
@@ -1773,27 +1777,23 @@ func (e *Engine) instanceNeedsUpdate(d *direction, src, dst model.Instance) bool
 	return !reflect.DeepEqual(e.proxiedMetadata(d, src), dst.Metadata)
 }
 
-// ensureWriteLeader 在每次对账前确认方向级写主。任何选主查询异常都 fail-closed，
+// ensureWorker 在每次对账前确认方向级写入节点。任何Worker 心跳查询异常都 fail-closed，
 // 防止多节点在无法看到彼此候选时退化为并发写。
-func (e *Engine) ensureWriteLeader(rd *runningDir) (bool, error) {
-	if e.leader == nil { // 纯单元测试替身不启动选主
+func (e *Engine) ensureWorker(rd *runningDir) (bool, error) {
+	if e.worker == nil { // 纯单元测试替身不连接真实 Nacos
 		return true, nil
 	}
 	d := rd.direction()
-	cli, err := e.dstClient(rd)
-	if err != nil {
+	rd.clientMu.Lock()
+	cli := rd.workerClient
+	rd.clientMu.Unlock()
+	if cli == nil {
+		return false, fmt.Errorf("direction %s has no Worker heartbeat client", d.ID)
+	}
+	if err := e.worker.Ensure(cli, d.DstCID, d.Namespace, d.ID); err != nil {
 		return false, err
 	}
-	isLeader, err := e.leader.Ensure(cli, d.DstCID, d.Namespace, d.ID)
-	if err == nil {
-		// 记录本节点当前是否写主，供 /api/naming-sync 展示：
-		// 非主节点 Running=true 但不执行写对账（LastSync 停更属正常待命），
-		// 不暴露该状态时运维会误判“方向卡死”。
-		e.mu.Lock()
-		e.lastLeader[d.ID] = isLeader
-		e.mu.Unlock()
-	}
-	return isLeader, err
+	return true, nil
 }
 
 // dstClient 取得向目标集群写实例的客户端——即本方向【专属】的命名客户端（见 runningDir.dstClient）。
@@ -2024,7 +2024,6 @@ type DirectionStatus struct {
 	Services        []string `json:"services"`
 	Running         bool     `json:"running"`
 	Dubbo           bool     `json:"dubbo"`  // true = dubbo 动态方向（服务集合由枚举驱动，Services 恒为空）
-	Leader          bool     `json:"leader"` // 本节点当前是否该方向的写主（多节点部署下非主待命，不执行写对账）
 	LastSync        string   `json:"last_sync"`
 	LastError       string   `json:"last_error"`
 	LastSrcCount    int      `json:"last_source_count"` // 当前已跟踪的源实例数（含已判崩溃待确认）
@@ -2053,7 +2052,6 @@ func (e *Engine) Status() []DirectionStatus {
 		if _, ok := e.stops[id]; ok {
 			st.Running = true
 		}
-		st.Leader = e.lastLeader[id]
 		if t, ok := e.lastSync[id]; ok {
 			st.LastSync = t.Format(time.RFC3339)
 		}
