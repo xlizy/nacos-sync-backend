@@ -48,9 +48,11 @@ func TestTwoNodesPublishSameDirectionConcurrently(t *testing.T) {
 	e1, rd1, out1 := makeNode()
 	e2, rd2, out2 := makeNode()
 
+	start := make(chan struct{})
 	done := make(chan struct{}, 2)
-	go func() { e1.registerServiceProxied(context.Background(), rd1, "ORDER"); done <- struct{}{} }()
-	go func() { e2.registerServiceProxied(context.Background(), rd2, "ORDER"); done <- struct{}{} }()
+	go func() { <-start; e1.registerServiceProxied(context.Background(), rd1, "ORDER"); done <- struct{}{} }()
+	go func() { <-start; e2.registerServiceProxied(context.Background(), rd2, "ORDER"); done <- struct{}{} }()
+	close(start)
 	<-done
 	<-done
 
@@ -87,5 +89,20 @@ func TestRapidSourceRestartUpdatesChangedSpecification(t *testing.T) {
 	}
 	if !sameSourceSpec(restarted, restarted) {
 		t.Fatal("an unchanged source snapshot must remain idempotent")
+	}
+
+	out := make(chan vo.BatchRegisterInstanceParam, 1)
+	rd := &runningDir{
+		d: &direction{ID: "g/src->g/dst/", SrcCID: "src", DstCID: "dst"},
+		dstClient: multiNodeBatchClient{out: out},
+		registered: map[string]regEntry{regKey("ORDER", restarted): {svc: "ORDER", inst: restarted}},
+		failCount: map[string]int{},
+		dead: map[string]regEntry{},
+	}
+	e := &Engine{logger: zap.NewNop()}
+	e.registerServiceProxied(context.Background(), rd, "ORDER")
+	published := <-out
+	if len(published.Instances) != 1 || published.Instances[0].Metadata["build"] != "new" {
+		t.Fatalf("restarted source specification was not republished: %+v", published.Instances)
 	}
 }
