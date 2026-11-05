@@ -1406,16 +1406,22 @@ func (e *Engine) dispatchOps(ctx context.Context, rd *runningDir, ops []regOp) {
 	seen := make(map[string]struct{}, len(ops))
 	appendTask := func(item task) {
 		key := fmt.Sprintf("%t:%s", item.add, regKey(item.svc, item.in))
-		if _, ok := seen[key]; ok { return }
+		if _, ok := seen[key]; ok {
+			return
+		}
 		seen[key] = struct{}{}
-		if _, ok := groups[item.svc]; !ok { order = append(order, item.svc) }
+		if _, ok := groups[item.svc]; !ok {
+			order = append(order, item.svc)
+		}
 		groups[item.svc] = append(groups[item.svc], item)
 	}
 	for _, op := range ops {
 		if op.add && op.in.Ip == "" && op.in.Port == 0 {
 			rd.mu.Lock()
 			for _, re := range rd.registered {
-				if re.svc == op.svc { appendTask(task{add:true, svc:re.svc, in:re.inst}) }
+				if re.svc == op.svc {
+					appendTask(task{add: true, svc: re.svc, in: re.inst})
+				}
 			}
 			rd.mu.Unlock()
 			continue
@@ -1429,11 +1435,20 @@ func (e *Engine) dispatchOps(ctx context.Context, rd *runningDir, ops []regOp) {
 		run := func(taskCtx context.Context) {
 			defer wg.Done()
 			for _, item := range tasks {
-				if taskCtx.Err() != nil { return }
-				if item.add { e.registerProxied(taskCtx, rd, item.svc, item.in) } else { e.deregisterProxied(taskCtx, rd, item.svc, item.in) }
+				if taskCtx.Err() != nil {
+					return
+				}
+				if item.add {
+					e.registerProxied(taskCtx, rd, item.svc, item.in)
+				} else {
+					e.deregisterProxied(taskCtx, rd, item.svc, item.in)
+				}
 			}
 		}
-		if e.pl == nil { run(ctx); continue }
+		if e.pl == nil {
+			run(ctx)
+			continue
+		}
 		if err := e.pl.Submit(ctx, run); err != nil {
 			wg.Done()
 			rd.writeFailed.Store(true)
@@ -1759,20 +1774,28 @@ func (e *Engine) instanceNeedsUpdate(d *direction, src, dst model.Instance) bool
 // ensureWorker 确认 Worker 心跳；与业务实例共用方向唯一客户端。
 // 连接故障时整体重建方向客户端，并由本轮/下轮全量对账补回全部实例。
 func (e *Engine) ensureWorker(rd *runningDir) (bool, error) {
-	if e.worker == nil { return true, nil }
+	if e.worker == nil {
+		return true, nil
+	}
 	d := rd.direction()
 	rd.clientMu.Lock()
 	client := rd.dstClient
 	rd.clientMu.Unlock()
-	if client == nil { return false, fmt.Errorf("direction %s has no naming client", d.ID) }
+	if client == nil {
+		return false, fmt.Errorf("direction %s has no naming client", d.ID)
+	}
 	if err := e.worker.Ensure(client, d.DstCID, d.Namespace, d.ID); err == nil {
 		return true, nil
 	} else if !nacos.IsConnectionError(err) {
 		return false, err
 	} else {
-		if e.mgr == nil { return false, fmt.Errorf("rebuild direction client: manager nil: %w", err) }
+		if e.mgr == nil {
+			return false, fmt.Errorf("rebuild direction client: manager nil: %w", err)
+		}
 		replacement, buildErr := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
-		if buildErr != nil { return false, fmt.Errorf("rebuild direction client: %w (previous: %v)", buildErr, err) }
+		if buildErr != nil {
+			return false, fmt.Errorf("rebuild direction client: %w (previous: %v)", buildErr, err)
+		}
 		if retryErr := e.worker.Ensure(replacement, d.DstCID, d.Namespace, d.ID); retryErr != nil {
 			e.mgr.CloseDedicatedNamingClient(replacement)
 			return false, fmt.Errorf("re-register Worker after reconnect: %w", retryErr)
@@ -1781,7 +1804,9 @@ func (e *Engine) ensureWorker(rd *runningDir) (bool, error) {
 		old := rd.dstClient
 		rd.dstClient = replacement
 		rd.clientMu.Unlock()
-		if old != nil { e.mgr.CloseDedicatedNamingClient(old) }
+		if old != nil {
+			e.mgr.CloseDedicatedNamingClient(old)
+		}
 		// 关闭旧 ephemeral 连接会摘除其发布实例；syncService 随后强制重发完整 desired 集合。
 		rd.republishAll.Store(true)
 		return true, nil
@@ -1790,10 +1815,15 @@ func (e *Engine) ensureWorker(rd *runningDir) (bool, error) {
 
 // registerProxied 通过方向共享客户端注册一个源实例。
 func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
-	if ctx.Err() != nil { return }
+	if ctx.Err() != nil {
+		return
+	}
 	rk := regKey(svc, in)
 	rd.mu.Lock()
-	if rd.stopped { rd.mu.Unlock(); return }
+	if rd.stopped {
+		rd.mu.Unlock()
+		return
+	}
 	d := rd.d
 	rd.mu.Unlock()
 
@@ -1805,7 +1835,9 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 			d.ID, svc, instKey(in), metadataLength)
 	}
 	if err != nil {
-		rd.mu.Lock(); rd.failCount[rk]++; rd.mu.Unlock()
+		rd.mu.Lock()
+		rd.failCount[rk]++
+		rd.mu.Unlock()
 		rd.writeFailed.Store(true)
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 		e.setErr(d.ID, err)
@@ -1827,12 +1859,16 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 			Enable: in.Enable, Healthy: in.Healthy, Ephemeral: true,
 			Metadata: metadata, ClusterName: in.ClusterName,
 		})
-		if err == nil && !ok { err = fmt.Errorf("nacos rejected register instance") }
+		if err == nil && !ok {
+			err = fmt.Errorf("nacos rejected register instance")
+		}
 	}
 	if err != nil {
 		err = fmt.Errorf("register proxied instance failed target_cluster=%q namespace=%q service=%q instance=%s: %w",
 			d.DstCID, d.Namespace, svc, instKey(in), err)
-		rd.mu.Lock(); rd.failCount[rk]++; rd.mu.Unlock()
+		rd.mu.Lock()
+		rd.failCount[rk]++
+		rd.mu.Unlock()
 		rd.writeFailed.Store(true)
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 		e.setErr(d.ID, err)
@@ -1840,7 +1876,9 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)), zap.Error(err))
 		return
 	}
-	rd.mu.Lock(); delete(rd.failCount, rk); rd.mu.Unlock()
+	rd.mu.Lock()
+	delete(rd.failCount, rk)
+	rd.mu.Unlock()
 	e.logger.Debug("register proxied instance ok",
 		zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)))
 	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
@@ -1849,20 +1887,26 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 // deregisterProxied 注销单实例后，重新发布同服务剩余期望实例，保持 service 级 redo cache 一致。
 // 同一服务的操作由 dispatchOps 串行化，避免注销与重发互相覆盖。
 func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
-	if ctx.Err() != nil { return }
+	if ctx.Err() != nil {
+		return
+	}
 	d := rd.direction()
 	rd.clientMu.Lock()
 	client := rd.dstClient
 	rd.clientMu.Unlock()
 	if client == nil {
 		err := fmt.Errorf("direction %s has no naming client", d.ID)
-		rd.writeFailed.Store(true); e.setErr(d.ID, err); return
+		rd.writeFailed.Store(true)
+		e.setErr(d.ID, err)
+		return
 	}
 	ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
 		ServiceName: svc, GroupName: defaultGroup,
 		Ip: in.Ip, Port: in.Port, Ephemeral: true, Cluster: in.ClusterName,
 	})
-	if err == nil && !ok { err = fmt.Errorf("nacos rejected deregister instance") }
+	if err == nil && !ok {
+		err = fmt.Errorf("nacos rejected deregister instance")
+	}
 	if err != nil {
 		rd.writeFailed.Store(true)
 		e.setErr(d.ID, fmt.Errorf("deregister proxied instance service=%q instance=%q: %w", svc, instKey(in), err))
@@ -1874,11 +1918,15 @@ func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc stri
 	rd.mu.Lock()
 	remaining := make([]model.Instance, 0)
 	for _, re := range rd.registered {
-		if re.svc == svc && regKey(svc, re.inst) != regKey(svc, in) { remaining = append(remaining, re.inst) }
+		if re.svc == svc && regKey(svc, re.inst) != regKey(svc, in) {
+			remaining = append(remaining, re.inst)
+		}
 	}
 	rd.mu.Unlock()
 	for _, current := range remaining {
-		if ctx.Err() != nil { return }
+		if ctx.Err() != nil {
+		return
+	}
 		e.registerProxied(ctx, rd, svc, current)
 	}
 	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
@@ -1904,7 +1952,9 @@ func (e *Engine) updateCounts(rd *runningDir) {
 	tracked := len(rd.registered) + len(rd.dead)
 	proxied := 0
 	for rk := range rd.registered {
-		if rd.failCount[rk] == 0 { proxied++ }
+		if rd.failCount[rk] == 0 {
+			proxied++
+		}
 	}
 	rd.mu.Unlock()
 	e.mu.Lock()
@@ -1923,7 +1973,9 @@ func isProxied(in model.Instance) bool {
 
 // isOurs 判断目标实例是否由指定源集群代注册（归属仅使用 syncSourceCluster 字段）。
 func isOurs(in model.Instance, srcCID, _ string) bool {
-	return in.Metadata != nil && in.Metadata[metaSyncSource] == "NACOS" && in.Metadata[metaSyncSourceCluster] == srcCID
+	return in.Metadata != nil &&
+		in.Metadata[metaSyncSource] == "NACOS" &&
+		in.Metadata[metaSyncSourceCluster] == srcCID
 }
 
 // instanceSpecKey distinguishes publisher records that share an endpoint but
