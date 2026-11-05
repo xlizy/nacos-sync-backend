@@ -625,14 +625,18 @@ func (e *Engine) isEcho(src, dst, ns, group, dataId, content string) bool {
 	}
 	rec := v.(pushRec)
 	if time.Since(rec.at) > echoTTL {
-		e.pushed.Delete(key)
+		// Delete only the exact record we inspected. A concurrent publish may
+		// already have replaced it with a newer echo for the same key.
+		e.pushed.CompareAndDelete(key, v)
 		return false
 	}
-	if rec.hash == hashContent(content) {
-		e.pushed.Delete(key)
-		return true
+	if rec.hash != hashContent(content) {
+		return false
 	}
-	return false
+	// Load+Delete is not an atomic consume: concurrent callbacks could both
+	// observe the same record and both suppress their events. CompareAndDelete
+	// makes consumption one-shot and cannot remove a newer replacement record.
+	return e.pushed.CompareAndDelete(key, v)
 }
 
 // gcEcho 周期性清理回声表中超过 echoTTL 的残留条目。回声表本就在 isEcho 命中时删除，
