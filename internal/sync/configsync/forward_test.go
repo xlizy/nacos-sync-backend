@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
@@ -83,5 +84,44 @@ func TestForwardDoesNotPublishStalePayloadWhenSourceReadFails(t *testing.T) {
 	}
 	if len(tgt.published) != 0 || tgt.deleted != 0 {
 		t.Fatalf("published/deleted despite source read failure: published=%v deleted=%d", tgt.published, tgt.deleted)
+	}
+}
+
+
+func TestIsEchoConsumesMatchingRecordOnlyOnce(t *testing.T) {
+	e := &Engine{}
+	e.recordPush("target", "source", "namespace", "DEFAULT_GROUP", "app.yaml", "echo-content")
+
+	const callers = 64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var consumed atomic.Int32
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if e.isEcho("source", "target", "namespace", "DEFAULT_GROUP", "app.yaml", "echo-content") {
+				consumed.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("matching echo record consumed by %d callbacks, want exactly 1", got)
+	}
+}
+
+func TestIsEchoDoesNotConsumeDifferentContent(t *testing.T) {
+	e := &Engine{}
+	e.recordPush("target", "source", "namespace", "DEFAULT_GROUP", "app.yaml", "expected-content")
+
+	if e.isEcho("source", "target", "namespace", "DEFAULT_GROUP", "app.yaml", "different-content") {
+		t.Fatal("different content must not be treated as an echo")
+	}
+	if !e.isEcho("source", "target", "namespace", "DEFAULT_GROUP", "app.yaml", "expected-content") {
+		t.Fatal("mismatched event must not consume the pending echo record")
 	}
 }
