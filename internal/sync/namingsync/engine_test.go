@@ -3,6 +3,7 @@ package namingsync
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -438,5 +439,63 @@ func TestRegisterProxiedPublishesWholeService(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("registerProxied did not call BatchRegisterInstance")
+	}
+}
+
+type cleanupTrackingClient struct {
+	stubNamingClient
+	active atomic.Int32
+	max    atomic.Int32
+	count  atomic.Int32
+}
+
+func (c *cleanupTrackingClient) DeregisterInstance(vo.DeregisterInstanceParam) (bool, error) {
+	active := c.active.Add(1)
+	for {
+		old := c.max.Load()
+		if active <= old || c.max.CompareAndSwap(old, active) {
+			break
+		}
+	}
+	time.Sleep(5 * time.Millisecond)
+	c.count.Add(1)
+	c.active.Add(-1)
+	return true, nil
+}
+
+func TestCleanupDirectionUsesBoundedConcurrentDeregistration(t *testing.T) {
+	client := &cleanupTrackingClient{}
+	e := &Engine{
+		mgr:    nacos.NewClientManagerStub("dst", "", client),
+		logger: zap.NewNop(),
+	}
+	rd := &runningDir{
+		d:          &direction{ID: "src->dst", SrcCID: "src", DstCID: "dst"},
+		dstClient:  client,
+		registered: make(map[string]regEntry),
+		dead:       make(map[string]regEntry),
+		failCount:  make(map[string]int),
+	}
+	want := cleanupConcurrency*2 + 7
+	for i := 0; i < want; i++ {
+		in := model.Instance{Ip: "10.0.0.1", Port: uint64(1000 + i), ClusterName: "DEFAULT"}
+		rd.registered[regKey("ORDER", in)] = regEntry{svc: "ORDER", inst: in}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	e.cleanupDirection(ctx, rd)
+
+	if got := client.count.Load(); got != int32(want) {
+		t.Fatalf("cleanup processed %d instances, want %d", got, want)
+	}
+	if got := client.max.Load(); got <= 1 {
+		t.Fatalf("cleanup should issue concurrent deregistrations, max concurrency=%d", got)
+	}
+	if got := client.max.Load(); got > cleanupConcurrency {
+		t.Fatalf("cleanup concurrency exceeded limit: got %d, limit %d", got, cleanupConcurrency)
+	}
+	if !rd.isStopped() {
+		t.Fatal("cleanup must mark direction stopped")
 	}
 }
