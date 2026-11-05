@@ -118,7 +118,7 @@ func NewWithReadOnly(mgr *config.Manager, clientMgr *nacos.ClientManager, cfgEng
 	}
 	// 限流仅作用于高成本的枚举探测接口 /api/lookup，避免放大对受管 Nacos 的探测压力。
 	h.Use(lookupRateLimit())
-	register(h, mgr, clientMgr, cfgEngine, nameEngine, wk, logger, token, jwtSecret, cipher)
+	register(h, mgr, clientMgr, cfgEngine, nameEngine, wk, logger, token, jwtSecret, cipher, readOnly)
 	return &Server{h: h}
 }
 
@@ -270,7 +270,7 @@ func maskGroup(g config.NacosGroup) utils.H {
 	}
 }
 
-func register(h *server.Hertz, m *config.Manager, clientMgr *nacos.ClientManager, _ *configsync.Engine, nameEngine *namingsync.Engine, wk *watcher.Manager, logger *zap.Logger, token, jwtSecret string, cipher *auth.CredCipher) {
+func register(h *server.Hertz, m *config.Manager, clientMgr *nacos.ClientManager, _ *configsync.Engine, nameEngine *namingsync.Engine, wk *watcher.Manager, logger *zap.Logger, token, jwtSecret string, cipher *auth.CredCipher, readOnly bool) {
 	// 控制面鉴权：登录 JWT（Authorization: Bearer <jwt>）或静态共享令牌（NACOS_SYNC_API_TOKEN）均可通过；
 	// 存活/指标/登录相关接口（/api/auth/*）免鉴权；auth.enable=false 时全部放行。详见 JWTAuthMiddleware。
 	h.Use(JWTAuthMiddleware(m, jwtSecret, token))
@@ -285,6 +285,15 @@ func register(h *server.Hertz, m *config.Manager, clientMgr *nacos.ClientManager
 			return
 		}
 		ctx.JSON(consts.StatusServiceUnavailable, utils.H{"status": "DOWN", "deps": utils.H{"config_center": detail}})
+	})
+
+	// 运行模式显式暴露，避免 standby 节点的空同步状态被误判为同步故障。
+	h.GET("/api/runtime-mode", func(c context.Context, ctx *app.RequestContext) {
+		mode := "active"
+		if readOnly {
+			mode = "standby"
+		}
+		ctx.JSON(consts.StatusOK, utils.H{"mode": mode, "sync_enabled": !readOnly, "read_only": readOnly})
 	})
 
 	// 鉴权状态：前端据此判断是否需要在请求头附带 Bearer（RADIUS 未配置时回退静态令牌）。
