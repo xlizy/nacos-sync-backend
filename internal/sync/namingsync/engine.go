@@ -880,28 +880,43 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 	e.logger.Info("cleanup direction: deregistering proxied instances",
 		zap.String("dir", d.ID), zap.Int("count", len(entries)))
 
-	// 注销按方向串行执行，保证清理结束后没有迟到的注册/注销再落地。
-	for _, re := range entries {
+	// 有界并发注销：SDK 单次调用有独立超时且不接受 context，逐实例串行会让
+	// 400 个实例的关闭时间达到数十分钟。按 cleanupConcurrency 分批并发，
+	// 每批完成后检查方向/全局 deadline；最多只等待当前批次的 SDK 请求结束。
+	for start := 0; start < len(entries); start += cleanupConcurrency {
 		select {
 		case <-ctx.Done():
 			e.logger.Warn("cleanup deregister aborted by timeout, some instances may linger", zap.String("dir", d.ID))
 			return
 		default:
 		}
-		ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
-			ServiceName: re.svc, GroupName: defaultGroup, Ip: re.inst.Ip, Port: re.inst.Port,
-			Ephemeral: true, Cluster: re.inst.ClusterName,
-		})
-		if err == nil && !ok {
-			err = fmt.Errorf("nacos rejected cleanup deregister")
+		end := start + cleanupConcurrency
+		if end > len(entries) {
+			end = len(entries)
 		}
-		if err != nil {
-			e.logger.Error("cleanup deregister proxied failed", zap.String("dir", d.ID), zap.String("svc", re.svc),
-				zap.String("inst", instKey(re.inst)), zap.Error(err))
-			metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
-			continue
+		var batch sync.WaitGroup
+		for _, entry := range entries[start:end] {
+			re := entry
+			batch.Add(1)
+			go func() {
+				defer batch.Done()
+				ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
+					ServiceName: re.svc, GroupName: defaultGroup, Ip: re.inst.Ip, Port: re.inst.Port,
+					Ephemeral: true, Cluster: re.inst.ClusterName,
+				})
+				if err == nil && !ok {
+					err = fmt.Errorf("nacos rejected cleanup deregister")
+				}
+				if err != nil {
+					e.logger.Error("cleanup deregister proxied failed", zap.String("dir", d.ID), zap.String("svc", re.svc),
+						zap.String("inst", instKey(re.inst)), zap.Error(err))
+					metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
+					return
+				}
+				e.logger.Info("cleanup deregister proxied ok", zap.String("dir", d.ID), zap.String("svc", re.svc), zap.String("inst", instKey(re.inst)))
+			}()
 		}
-		e.logger.Info("cleanup deregister proxied ok", zap.String("dir", d.ID), zap.String("svc", re.svc), zap.String("inst", instKey(re.inst)))
+		batch.Wait()
 	}
 
 	
