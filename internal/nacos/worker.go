@@ -98,7 +98,7 @@ func WorkerScopes(instances []model.Instance) map[string]bool {
 		if !in.Ephemeral || !in.Enable || !in.Healthy || in.Metadata[workerIDMeta] == "" {
 			continue
 		}
-		if scope := in.Metadata[workerDirectionMeta]; scope != "" {
+		if scope := in.Metadata[workerDirectionMeta]; scope != "" && in.ClusterName == workerCluster(scope) {
 			out[scope] = true
 		}
 	}
@@ -113,7 +113,8 @@ func HasOtherWorker(instances []model.Instance, scope string, self *DirectionWor
 	}
 	for _, in := range instances {
 		if !in.Ephemeral || !in.Enable || !in.Healthy ||
-			in.Metadata[workerDirectionMeta] != scope || in.Metadata[workerIDMeta] == "" {
+			in.Metadata[workerDirectionMeta] != scope || in.Metadata[workerIDMeta] == "" ||
+			in.ClusterName != workerCluster(scope) {
 			continue
 		}
 		if in.Ip == self.agentIP && in.Port == self.agentPort && in.Metadata[workerIDMeta] == self.workerID {
