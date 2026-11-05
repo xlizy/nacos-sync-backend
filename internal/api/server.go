@@ -60,7 +60,7 @@ type Server struct {
 }
 
 // New 构造、设监听端口并注册路由（不立即监听）。
-// 所有实例均运行完整控制面；多实例部署采用 Active-Active，不提供 Standby 只读模式。
+// 所有实例均运行完整控制面；多实例部署采用 Active-Active。
 func New(mgr *config.Manager, clientMgr *nacos.ClientManager, cfgEngine *configsync.Engine, nameEngine *namingsync.Engine, wk *watcher.Manager, logger *zap.Logger) *Server {
 	h := server.New(server.WithHostPorts(fmt.Sprintf(":%d", DefaultHTTPPort)))
 
