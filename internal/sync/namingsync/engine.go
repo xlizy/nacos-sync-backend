@@ -8,7 +8,7 @@
 //   - 防回环：复制实例带 syncSource=NACOS，拉取源实例时过滤掉这些，避免 A→B→A 风暴；
 //     同时按 syncSourceCluster 归属，各方向仅清理自己产生的代注册实例，互不越界。
 //   - 生命周期（硬性要求：源节点不论优雅停还是崩溃停，代注册实例都要第一时间注销）：
-//     代注册实例采用 ephemeral=true（走 gRPC），并绑定在本同步服务到目标集群的专属连接上。
+//     代注册实例采用 ephemeral=true（走 gRPC），每个实例绑定在独立的目标集群专属连接上。
 //     源实例消失时由两条路径收敛：
 //     ① 源实例列表快轮询：每 sourcePollInterval 通过 ClientManager.InstancesLive 使用独立 gRPC 查询
 //        拉取源端实时实例列表（绕过 SDK 本地缓存），与本方向 desired 集合对账并增删。
