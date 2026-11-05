@@ -134,7 +134,7 @@ func TestDubboStaleServicesReturnsLastSuccess(t *testing.T) {
 	want := []string{"providers:com.foo.Bar:1.0.0", "consumers:com.foo.Baz"}
 	e := &Engine{dubboDisco: map[string]*discoState{
 		dirID: {
-			lastAt:   time.Now().Add(-10 * time.Second), // 远超 dubboDiscoCache，缓存已过期
+			lastAt:   time.Now().Add(-1 * time.Minute), // 确保超过 30s 缓存有效期
 			services: want,
 		},
 	}}
