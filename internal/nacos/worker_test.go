@@ -64,3 +64,14 @@ func TestPeerRemainsActiveAfterNodeDisconnectAndRecovery(t *testing.T) {
 		t.Fatalf("recovered node must rejoin the active Worker set: %v", active)
 	}
 }
+
+func TestWorkerScopesRejectsMismatchedWorkerID(t *testing.T) {
+	bad := workerInstance("10.0.0.9", 9696, "dir-a", "forged-worker-id", true)
+	if got := WorkerScopes([]model.Instance{bad}); len(got) != 0 {
+		t.Fatalf("worker with mismatched identity metadata must not keep a direction alive: %v", got)
+	}
+	self := NewDirectionWorker(nil, "10.0.0.1", 9696)
+	if HasOtherWorker([]model.Instance{bad}, "dir-a", self) {
+		t.Fatal("worker with mismatched identity metadata must not count as a peer")
+	}
+}
