@@ -2091,6 +2091,9 @@ func (e *Engine) recordPendingDeregister(rd *runningDir, key, svc string, in mod
 	if rd.pendingDeregister == nil {
 		rd.pendingDeregister = make(map[string]pendingDeregister)
 	}
+	if old, ok := rd.pendingDeregister[key]; ok && old.force {
+		force = true
+	}
 	rd.pendingDeregister[key] = pendingDeregister{entry: regEntry{svc: svc, inst: in}, force: force}
 	rd.mu.Unlock()
 }
@@ -2115,7 +2118,10 @@ func (e *Engine) flushPendingDeregistrations(ctx context.Context, rd *runningDir
 		if ctx.Err() != nil {
 			return
 		}
-		if !item.force {
+		// If the service has since been re-added to this direction, treat the
+		// old forced removal as cancellable and preserve the newly desired instance.
+		mustForce := item.force && !directionManagesService(d, item.entry.svc)
+		if !mustForce {
 			natives, cached := sourceCache[item.entry.svc]
 			if !cached {
 				list, err := e.mgr.InstancesLive(d.SrcCID, d.Namespace, item.entry.svc, defaultGroup)
@@ -2133,7 +2139,7 @@ func (e *Engine) flushPendingDeregistrations(ctx context.Context, rd *runningDir
 				continue
 			}
 		}
-		e.deregisterProxied(ctx, rd, item.entry.svc, item.entry.inst, item.force)
+		e.deregisterProxied(ctx, rd, item.entry.svc, item.entry.inst, mustForce)
 	}
 }
 
