@@ -1112,7 +1112,7 @@ func (e *Engine) isGloballyManaged(s sweepScan, svc string, inst model.Instance,
 	directions := e.resolveDirections(cfg)
 
 	// 新实例带有方向 ID。只有该方向仍活跃、仍指向当前目标，且当前配置仍
-	// 管理此服务时才保护它；仅凭方向 Leader 存活会让已移出白名单的服务成为永久孤儿。
+	// 管理此服务时才保护它；仅凭方向 Worker 心跳存活会让已移出白名单的服务成为永久孤儿。
 	if dirID := inst.Metadata[metaSyncSourceDirection]; dirID != "" {
 		if !active[dirID] {
 			return false
@@ -1704,7 +1704,7 @@ func (e *Engine) probe(ctx context.Context, rd *runningDir) {
 		return
 	}
 	// 仅快照 dead 集合：registered 存活实例不参与探活（结果无决策作用，纯 TCP 开销）。
-	// dead 常规恒为空（崩溃判定已移除）：先快照再查 leader，空集合直接返回，
+	// dead 常规恒为空（崩溃判定已移除）：先快照再确认 Worker 心跳，空集合直接返回，
 	// 省掉每 1s tick 一次的Worker 心跳查询（InstancesLive）。
 	rd.mu.Lock()
 	if len(rd.dead) == 0 {
@@ -1718,7 +1718,7 @@ func (e *Engine) probe(ctx context.Context, rd *runningDir) {
 	rd.mu.Unlock()
 
 	workerReady, err := e.ensureWorker(rd)
-	if err != nil || !leader {
+	if err != nil || !workerReady {
 		if err != nil {
 			e.setErr(rd.direction().ID, err)
 		}
