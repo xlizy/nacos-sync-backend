@@ -9,6 +9,9 @@ func TestIsConnectionError(t *testing.T) {
 		"client is closed",
 		"no available server",
 		"Connection refused",
+		"connection reset by peer",
+		"broken pipe",
+		"rpc error: code = Unavailable desc = transport is closing",
 	} {
 		if !IsConnectionError(errString(msg)) {
 			t.Errorf("expected connection error for %q", msg)
