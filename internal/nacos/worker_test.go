@@ -44,3 +44,21 @@ func TestHasOtherWorkerProtectsPeerDuringShutdown(t *testing.T) {
 		t.Fatal("workers for another direction must not protect this direction")
 	}
 }
+
+func TestPeerRemainsActiveAfterNodeDisconnectAndRecovery(t *testing.T) {
+	self := NewDirectionWorker(nil, "10.0.0.1", 9696)
+	peer := workerInstance("10.0.0.2", 9696, "dir-a", "10.0.0.2:9696", true)
+
+	// Node 1 disappears: node 2's heartbeat alone must keep dir-a globally active.
+	active := WorkerScopes([]model.Instance{peer})
+	if !active["dir-a"] || !HasOtherWorker([]model.Instance{peer}, "dir-a", self) {
+		t.Fatalf("remaining peer must keep direction active after node disconnect: %v", active)
+	}
+
+	// A recovered node registers a new heartbeat; the direction remains active with both workers.
+	recovered := workerInstance("10.0.0.1", 9696, "dir-a", "10.0.0.1:9696", true)
+	active = WorkerScopes([]model.Instance{peer, recovered})
+	if !active["dir-a"] || !HasOtherWorker([]model.Instance{peer, recovered}, "dir-a", self) {
+		t.Fatalf("recovered node must rejoin the active Worker set: %v", active)
+	}
+}
