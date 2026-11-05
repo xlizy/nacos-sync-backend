@@ -268,7 +268,7 @@ func (e *Engine) watchNamespace(ctx context.Context, link config.SyncLink, names
 	const maxRetry = 5
 	var lastErr error
 	for attempt := 0; attempt < maxRetry; attempt++ {
-		src, items, err := e.setupWatch(ctx, link, namespace)
+		src, tgt, items, err := e.setupWatch(ctx, link, namespace)
 		if err != nil {
 			lastErr = err
 			e.logger.Warn("config watch namespace setup failed, retrying",
@@ -369,19 +369,19 @@ func dataRefKey(it dataRef) string { return it.Group + "\x00" + it.DataId }
 
 // setupWatch 完成单次监听建立（建连 + 枚举 + 初始点火 + 注册监听）。失败时返回错误，由 watchNamespace 重试。
 // 成功时回传源客户端与已注册监听的配置项，供调用方在取消时逐一撤销监听（释放 SDK 回调）。
-func (e *Engine) setupWatch(ctx context.Context, link config.SyncLink, namespace string) (config_client.IConfigClient, []dataRef, error) {
+func (e *Engine) setupWatch(ctx context.Context, link config.SyncLink, namespace string) (config_client.IConfigClient, config_client.IConfigClient, []dataRef, error) {
 	src, err := e.mgr.ConfigClient(link.From, namespace)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	tgt, err := e.mgr.ConfigClient(link.To, namespace)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	items, err := e.enumerate(ctx, src)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// 初始点火：把源集群当前配置推一次到目标，确保既有配置的客户端也被通知。
@@ -443,10 +443,10 @@ func (e *Engine) setupWatch(ctx context.Context, link config.SyncLink, namespace
 			e.logger.Error("listen config failed; rolled back partial listens",
 				zap.String("link", linkKey(link)), zap.String("ns", namespace),
 				zap.String("dataId", it.DataId), zap.Error(err))
-			return nil, nil, fmt.Errorf("listen config %s: %w", it.DataId, err)
+			return nil, nil, nil, fmt.Errorf("listen config %s: %w", it.DataId, err)
 		}
 	}
-	return src, items, nil
+	return src, tgt, items, nil
 }
 
 // initialPropagate 推送单个配置到目标以点燃其本地通知。冷却判定已上移到 setupWatch 批次级。
