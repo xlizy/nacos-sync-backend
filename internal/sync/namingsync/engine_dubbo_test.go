@@ -134,7 +134,7 @@ func TestDubboStaleServicesReturnsLastSuccess(t *testing.T) {
 	want := []string{"providers:com.foo.Bar:1.0.0", "consumers:com.foo.Baz"}
 	e := &Engine{dubboDisco: map[string]*discoState{
 		dirID: {
-			lastAt:   time.Now().Add(-10 * time.Second), // 远超 dubboDiscoCache(2s)，缓存已过期
+			lastAt:   time.Now().Add(-10 * time.Second), // 远超 dubboDiscoCache，缓存已过期
 			services: want,
 		},
 	}}
@@ -229,11 +229,11 @@ func TestDubboServicesForReconcileEnumOnly(t *testing.T) {
 }
 
 
-// TestDubboDiscoveryInterval 每个方向的原始 Dubbo 服务名枚举缓存周期为 10 秒。
+// TestDubboDiscoveryInterval 每个方向的原始 Dubbo 服务名枚举缓存周期为 30 秒。
 // 双向方向分别查询各自源端，因此两端都会被周期性枚举。
 func TestDubboDiscoveryInterval(t *testing.T) {
-	if dubboDiscoCache != 10*time.Second {
-		t.Fatalf("dubbo discovery interval = %s, want 10s", dubboDiscoCache)
+	if dubboDiscoCache != 30*time.Second {
+		t.Fatalf("dubbo discovery interval = %s, want 30s", dubboDiscoCache)
 	}
 }
 
