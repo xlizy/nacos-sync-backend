@@ -2,8 +2,6 @@ package namingsync
 
 import (
 	"context"
-	"net"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
