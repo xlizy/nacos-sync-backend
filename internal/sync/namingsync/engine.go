@@ -881,14 +881,14 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 	// BatchRegisterInstance 把该 publisher 设为完整实例集合，而服务端 DeregisterInstance
 	// 会直接 removeServiceInstance(service)，即一次注销会移除本连接该服务的整份发布集合。
 	// 因此这里必须按服务去重，不能对同一服务的每个实例重复发送注销 RPC。
-	services := make([]string, 0)
+	services := make([]regEntry, 0)
 	seenServices := make(map[string]struct{}, len(entries))
 	for _, re := range entries {
 		if _, ok := seenServices[re.svc]; ok {
 			continue
 		}
 		seenServices[re.svc] = struct{}{}
-		services = append(services, re.svc)
+		services = append(services, re) // SDK request still carries a representative instance identity
 	}
 	e.logger.Info("cleanup direction: deregistering proxied services",
 		zap.String("dir", d.ID), zap.Int("services", len(services)), zap.Int("instances", len(entries)))
@@ -906,23 +906,24 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 			end = len(services)
 		}
 		var batch sync.WaitGroup
-		for _, svc := range services[start:end] {
-			service := svc
+		for _, entry := range services[start:end] {
+			re := entry
 			batch.Add(1)
 			go func() {
 				defer batch.Done()
 				ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
-					ServiceName: service, GroupName: defaultGroup, Ephemeral: true,
+					ServiceName: re.svc, GroupName: defaultGroup, Ip: re.inst.Ip, Port: re.inst.Port,
+					Ephemeral: true, Cluster: re.inst.ClusterName,
 				})
 				if err == nil && !ok {
 					err = fmt.Errorf("nacos rejected cleanup deregister")
 				}
 				if err != nil {
-					e.logger.Error("cleanup deregister proxied service failed", zap.String("dir", d.ID), zap.String("svc", service), zap.Error(err))
+					e.logger.Error("cleanup deregister proxied service failed", zap.String("dir", d.ID), zap.String("svc", re.svc), zap.Error(err))
 					metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 					return
 				}
-				e.logger.Info("cleanup deregister proxied service ok", zap.String("dir", d.ID), zap.String("svc", service))
+				e.logger.Info("cleanup deregister proxied service ok", zap.String("dir", d.ID), zap.String("svc", re.svc))
 			}()
 		}
 		batch.Wait()
