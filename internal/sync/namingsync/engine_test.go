@@ -314,80 +314,58 @@ func (stubNamingClient) DeregisterInstance(vo.DeregisterInstanceParam) (bool, er
 // captureNamingClient 捕获写路径实际发出的 RegisterInstance 参数，用于断言代注册 metadata。
 type captureNamingClient struct {
 	naming_client.INamingClient
-	got chan vo.RegisterInstanceParam
+	got chan vo.BatchRegisterInstanceParam
 }
 
-func (c captureNamingClient) RegisterInstance(p vo.RegisterInstanceParam) (bool, error) {
+func (c captureNamingClient) BatchRegisterInstance(p vo.BatchRegisterInstanceParam) (bool, error) {
 	c.got <- p
 	return true, nil
 }
 
-// TestRegisterProxiedWritesSyncSourceAgent 锁定「代注册溯源」不变量：registerProxied 写入的
-// 目标实例必须带齐两个溯源元数据——syncSource=NACOS、syncSourceCluster=源CID
-// （syncSourceAgent=本机 IP 的写入已临时关闭，见 engine.go registerProxied，恢复时一并放开）；同时原样保留源实例 metadata。
-func TestRegisterProxiedWritesSyncSourceAgent(t *testing.T) {
-	pl, err := pool.New(4, zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pl.Release()
-
-	// 监听本地端口，使源实例 ip:port 通过「僵尸门禁」的 TCP 探活（否则被判定为僵尸跳过代注册）。
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	_, portStr, _ := net.SplitHostPort(l.Addr().String())
-	port, _ := strconv.ParseUint(portStr, 10, 16)
-
-	const agentIP = "10.10.171.157"
-	capCh := make(chan vo.RegisterInstanceParam, 1)
-	e := &Engine{
-		pl:      pl,
-		logger:  zap.NewNop(),
-		agentIP: agentIP,
-	}
-	e.mgr = nacos.NewClientManagerStub("d", "", captureNamingClient{got: capCh})
+// TestRegisterProxiedPublishesWholeService verifies that a single recovery/add
+// operation publishes every locally desired instance for the service in one batch,
+// and that node-specific metadata cannot cause Active-Active nodes to overwrite it.
+func TestRegisterProxiedPublishesWholeService(t *testing.T) {
+	capCh := make(chan vo.BatchRegisterInstanceParam, 1)
+	e := &Engine{logger: zap.NewNop()}
 	rd := &runningDir{
-		d:          &direction{ID: "g/s->g/d/", SrcCID: "s", DstCID: "d"},
-		dstClient:  captureNamingClient{got: capCh},
-		registered: map[string]regEntry{},
-		failCount:  map[string]int{},
-		dead:       map[string]regEntry{},
+		d: &direction{ID: "g/s->g/d/", SrcCID: "s", DstCID: "d"},
+		dstClient: captureNamingClient{got: capCh},
+		registered: map[string]regEntry{
+			regKey("TEST-SVC", model.Instance{Ip: "10.0.0.1", Port: 8080}): {
+				svc: "TEST-SVC",
+				inst: model.Instance{Ip: "10.0.0.1", Port: 8080, Weight: 1, Enable: true, Healthy: true, Metadata: map[string]string{"k":"v"}},
+			},
+			regKey("TEST-SVC", model.Instance{Ip: "10.0.0.2", Port: 8080}): {
+				svc: "TEST-SVC",
+				inst: model.Instance{Ip: "10.0.0.2", Port: 8080, Weight: 1, Enable: true, Healthy: true},
+			},
+		},
+		failCount: map[string]int{},
+		dead: map[string]regEntry{},
 	}
-	in := model.Instance{
-		Ip:       "127.0.0.1",
-		Port:     port,
-		Weight:   1,
-		Enable:   true,
-		Healthy:  true,
-		Metadata: map[string]string{"k": "v", "preserved.register.source": "SPRING_CLOUD"},
-	}
-
-	e.registerProxied(context.Background(), rd, "TEST-SVC", in)
+	e.registerProxied(context.Background(), rd, "TEST-SVC", model.Instance{Ip:"10.0.0.1", Port:8080})
 
 	select {
 	case p := <-capCh:
-		if p.Metadata[metaSyncSource] != "NACOS" {
-			t.Fatalf("syncSource = %q, want NACOS", p.Metadata[metaSyncSource])
+		if p.ServiceName != "TEST-SVC" || len(p.Instances) != 2 {
+			t.Fatalf("batch should contain both desired service instances: %+v", p)
 		}
-		if p.Metadata[metaSyncSourceCluster] != "s" {
-			t.Fatalf("syncSourceCluster = %q, want s", p.Metadata[metaSyncSourceCluster])
+		found := map[string]bool{}
+		for _, in := range p.Instances {
+			found[in.Ip] = true
+			if in.Metadata[metaSyncSource] != "NACOS" || in.Metadata[metaSyncSourceCluster] != "s" {
+				t.Fatalf("missing ownership metadata: %+v", in.Metadata)
+			}
+			if _, ok := in.Metadata["syncSourceAgent"]; ok {
+				t.Fatalf("node-specific syncSourceAgent must not be published: %+v", in.Metadata)
+			}
 		}
-		// 同步服务本机 IP 溯源字段（syncSourceAgent）已临时关闭，恢复时取消下方注释：
-		// if p.Metadata[metaSyncSourceAgent] != agentIP {
-		// 	t.Fatalf("syncSourceAgent = %q, want %s", p.Metadata[metaSyncSourceAgent], agentIP)
-		// }
-		// 源实例 metadata 必须原样带到目标（除三个溯源键外）。
-		if p.Metadata["k"] != "v" || p.Metadata["preserved.register.source"] != "SPRING_CLOUD" {
-			t.Fatalf("源 metadata 未被原样保留: %v", p.Metadata)
+		if !found["10.0.0.1"] || !found["10.0.0.2"] {
+			t.Fatalf("batch lost an instance: %+v", found)
 		}
-		// 目标实例 ip/port 必须源自源实例。
-		if p.Ip != "127.0.0.1" || p.Port != port {
-			t.Fatalf("目标实例地址错误: %s:%d", p.Ip, p.Port)
-		}
+	}:
 	case <-time.After(2 * time.Second):
-		t.Fatal("registerProxied 未在 2s 内调用 RegisterInstance（可能被僵尸门禁误跳过）")
+		t.Fatal("registerProxied did not call BatchRegisterInstance")
 	}
 }
