@@ -62,10 +62,10 @@ func (c *retryTargetClient) PublishConfig(p vo.ConfigParam) (bool, error) {
 	return true, nil
 }
 
-func TestForwardDoesNotPublishStaleEventAfterSourceRefreshFailure(t *testing.T) {
+func TestForwardRefreshesSourceBeforeFirstPublishAndRetry(t *testing.T) {
 	src := &retrySourceClient{results: []getResult{
-		{err: errors.New("source temporarily unavailable")},
 		{content: "fresh-source-value"},
+		{content: "newer-source-value"},
 	}}
 	tgt := &retryTargetClient{failNext: true, current: "target-old"}
 	e := &Engine{logger: zap.NewNop()}
@@ -80,19 +80,19 @@ func TestForwardDoesNotPublishStaleEventAfterSourceRefreshFailure(t *testing.T) 
 	if len(tgt.published) != 2 {
 		t.Fatalf("expected first attempt and one verified retry, got %d publishes: %v", len(tgt.published), tgt.published)
 	}
-	if tgt.published[0] != "stale-event-value" {
-		t.Fatalf("first publish should use the received event payload, got %q", tgt.published[0])
+	if tgt.published[0] != "fresh-source-value" {
+		t.Fatalf("first publish must use current source value, got %q", tgt.published[0])
 	}
-	if tgt.published[1] != "fresh-source-value" {
-		t.Fatalf("retry must use the freshly read source value, got %q", tgt.published[1])
+	if tgt.published[1] != "newer-source-value" {
+		t.Fatalf("retry must re-read the latest source value, got %q", tgt.published[1])
 	}
 	if src.calls != 2 {
 		t.Fatalf("expected two source refresh attempts, got %d", src.calls)
 	}
 }
 
-func TestForwardSkipsPublishWhenTargetAlreadyHasSameContent(t *testing.T) {
-	src := &retrySourceClient{}
+func TestForwardPublishesWhenTargetAlreadyHasSameContent(t *testing.T) {
+	src := &retrySourceClient{results: []getResult{{content: "same-content"}}}
 	tgt := &retryTargetClient{current: "same-content"}
 	e := &Engine{logger: zap.NewNop()}
 	link := config.SyncLink{From: "source", To: "target", Kind: "config"}
@@ -102,10 +102,10 @@ func TestForwardSkipsPublishWhenTargetAlreadyHasSameContent(t *testing.T) {
 	}
 	tgt.mu.Lock()
 	defer tgt.mu.Unlock()
-	if len(tgt.published) != 0 {
-		t.Fatalf("matching target content must not be republished, got %v", tgt.published)
+	if len(tgt.published) != 1 || tgt.published[0] != "same-content" {
+		t.Fatalf("matching target content must still be published to notify target listeners, got %v", tgt.published)
 	}
 	if _, ok := e.pushed.Load(pushKey("source", "target", "public", "DEFAULT_GROUP", "app.yaml")); !ok {
-		t.Fatal("skipped duplicate publish must still record local echo")
+		t.Fatal("successful publish must record local echo")
 	}
 }
