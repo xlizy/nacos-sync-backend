@@ -736,15 +736,6 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 					zap.String("dir", d.ID), zap.String("role", "probe"), zap.Any("panic", r))
 			}
 		}()
-		defer func() {
-			// 仅当 runs 中仍是本协程对应的 rd 时才删除，避免方向「停→立即重启」时
-			// 旧协程退出把新方向的运行时状态误删。
-			e.mu.Lock()
-			if cur, ok := e.runs[d.ID]; ok && cur == rd {
-				delete(e.runs, d.ID)
-			}
-			e.mu.Unlock()
-		}()
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		for {
@@ -1024,6 +1015,8 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 			continue
 		}
 		cleaned := 0
+		observedOrphans := make(map[string]struct{})
+		completeScan := true
 		for _, svc := range names {
 			// 注意：NACOS-SYNC（appName）不再在此跳过。本后端自注册的 NACOS-SYNC 心跳不带
 			// syncSource=NACOS 元数据，下方 isProxied 检查已将其排除，不会误删；而代注册上来的
@@ -1031,7 +1024,8 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 			// 否则会残留本机 IP 这类代注册实例。
 			list, err := e.mgr.InstancesLive(s.dstCID, s.ns, svc, defaultGroup)
 			if err != nil {
-				// 实时查询瞬时失败（如连接重连中）：跳过该服务，下一周期重试，绝不中断整轮清扫。
+				// 任一服务查询失败时不做本轮 map GC，避免把暂时不可见的实例误当作已消失。
+				completeScan = false
 				e.logger.Debug("orphan sweep: query instances skipped", zap.String("service", svc), zap.Error(err))
 				continue
 			}
@@ -1039,6 +1033,8 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 				if inst.Metadata[metaSyncSource] != "NACOS" {
 					continue // 非本服务代注册，跳过（保护原生实例）
 				}
+				seenKey := s.label() + "\x00" + regKey(svc, inst)
+				observedOrphans[seenKey] = struct{}{}
 				if e.isGloballyManaged(s, svc, inst, cfg, activeDirections) {
 					e.clearOrphanSeen(s, svc, inst)
 					continue
@@ -1047,10 +1043,15 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 				if !e.orphanReady(s, svc, inst) {
 					continue
 				}
-				e.deregisterOrphan(cli, sweepTarget{dstGrp: s.dstGrp, dstCID: s.dstCID, ns: s.ns, service: svc}, inst)
-				e.clearOrphanSeen(s, svc, inst)
-				cleaned++
+				target := sweepTarget{dstGrp: s.dstGrp, dstCID: s.dstCID, ns: s.ns, service: svc}
+				if e.deregisterOrphan(cli, target, inst) {
+					e.clearOrphanSeen(s, svc, inst)
+					cleaned++
+				}
 			}
+		}
+		if completeScan {
+			e.pruneOrphanSeen(s, observedOrphans)
 		}
 		e.mgr.CloseDedicatedNamingClient(cli)
 		if cleaned > 0 {
@@ -1062,24 +1063,45 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 // isGloballyManaged 只根据目标集群中仍存活的方向候选判断 owner，绝不使用单节点内存。
 // 新版实例直接携带 syncSourceDirection；旧版实例按配置推导候选方向，任一方向仍存活即保护。
 func (e *Engine) isGloballyManaged(s sweepScan, svc string, inst model.Instance, cfg *config.Config, active map[string]bool) bool {
-	if dir := inst.Metadata[metaSyncSourceDirection]; dir != "" {
-		return active[dir]
-	}
 	srcCID := inst.Metadata[metaSyncSourceCluster]
-	for _, d := range e.resolveDirections(cfg) {
-		if d.SrcCID != srcCID || d.DstCID != s.dstCID || d.Namespace != s.ns {
-			continue
+	directions := e.resolveDirections(cfg)
+
+	// 新实例带有方向 ID。只有该方向仍活跃、仍指向当前目标，且当前配置仍
+	// 管理此服务时才保护它；仅凭方向 Leader 存活会让已移出白名单的服务成为永久孤儿。
+	if dirID := inst.Metadata[metaSyncSourceDirection]; dirID != "" {
+		if !active[dirID] {
+			return false
 		}
-		matches := d.Dubbo && isDubboService(svc)
-		if !d.Dubbo {
-			for _, configured := range d.Services {
-				if configured == svc {
-					matches = true
-					break
-				}
+		for _, d := range directions {
+			if d.ID != dirID || d.SrcCID != srcCID || d.DstCID != s.dstCID || d.Namespace != s.ns {
+				continue
 			}
+			return directionManagesService(d, svc)
 		}
-		if matches && active[d.ID] {
+		return false
+	}
+
+	// 兼容旧版本没有 syncSourceDirection 的实例：从当前拓扑反推归属。
+	for _, d := range directions {
+		if d.SrcCID == srcCID && d.DstCID == s.dstCID && d.Namespace == s.ns &&
+			active[d.ID] && directionManagesService(d, svc) {
+			return true
+		}
+	}
+	return false
+}
+
+// directionManagesService 判断当前方向配置是否仍包含指定服务。
+// Dubbo 方向的服务集由源端动态枚举驱动，静态方向则必须命中 Services 白名单。
+func directionManagesService(d *direction, svc string) bool {
+	if d == nil {
+		return false
+	}
+	if d.Dubbo {
+		return isDubboService(svc)
+	}
+	for _, configured := range d.Services {
+		if configured == svc {
 			return true
 		}
 	}
@@ -1104,11 +1126,28 @@ func (e *Engine) clearOrphanSeen(s sweepScan, svc string, inst model.Instance) {
 	e.orphanMu.Unlock()
 }
 
+// pruneOrphanSeen removes grace-period records for instances no longer present in a
+// complete target scan. It is deliberately not called after a partial scan: transient
+// query failures must not reset the grace period of instances that were not observed.
+func (e *Engine) pruneOrphanSeen(s sweepScan, observed map[string]struct{}) {
+	prefix := s.label() + "\x00"
+	e.orphanMu.Lock()
+	for key := range e.orphanSeen {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if _, ok := observed[key]; !ok {
+			delete(e.orphanSeen, key)
+		}
+	}
+	e.orphanMu.Unlock()
+}
+
 // deregisterOrphan 注销一个孤儿代注册实例。
 // 代注册实例始终以 ephemeral=true 注册（走 gRPC 代理；Nacos 3.x 不支持实例 HTTP OpenAPI，返回 501）。
 // 故此处按 ephemeral=true 走 gRPC DeregisterInstance 一次性移除；不尝试 HTTP 路径，避免 3.x 目标上无意义的 501 报错与指标污染。
-func (e *Engine) deregisterOrphan(client naming_client.INamingClient, t sweepTarget, inst model.Instance) {
-	_, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
+func (e *Engine) deregisterOrphan(client naming_client.INamingClient, t sweepTarget, inst model.Instance) bool {
+	ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
 		ServiceName: t.service,
 		GroupName:   defaultGroup,
 		Ip:          inst.Ip,
@@ -1116,14 +1155,18 @@ func (e *Engine) deregisterOrphan(client naming_client.INamingClient, t sweepTar
 		Ephemeral:   true, // 与注册一致，走 gRPC
 		Cluster:     inst.ClusterName,
 	})
+	if err == nil && !ok {
+		err = fmt.Errorf("nacos rejected orphan deregister")
+	}
 	if err != nil {
 		e.logger.Error("orphan sweep: deregister failed",
 			zap.String("target", t.label()), zap.String("inst", instKey(inst)), zap.Error(err))
 		metrics.SyncErrors.WithLabelValues(t.label(), "naming").Inc()
-		return
+		return false
 	}
 	e.logger.Info("orphan sweep: deregistered proxied instance",
 		zap.String("target", t.label()), zap.String("svc", t.service), zap.String("inst", instKey(inst)))
+	return true
 }
 
 // listServiceNames 通过服务端 GetAllServicesInfo 实时枚举某命名空间下的全部服务名（按页拉全）。
@@ -1329,7 +1372,7 @@ func (e *Engine) reconcileDisappearedDubboServices(ctx context.Context, rd *runn
 			continue
 		}
 		for _, in := range targets {
-			if isOurs(in, d.SrcCID) {
+			if isOurs(in, d.SrcCID, d.ID) {
 				e.deregisterProxied(ctx, rd, svc, in)
 			}
 		}
@@ -1928,11 +1971,18 @@ func isProxied(in model.Instance) bool {
 }
 
 // isOurs 判断目标实例是否为「本方向（srcCID）」代注册上去的（用于精准清理，不越界）。
-func isOurs(in model.Instance, srcCID string) bool {
-	if in.Metadata == nil {
+func isOurs(in model.Instance, srcCID, directionID string) bool {
+	if in.Metadata == nil ||
+		in.Metadata[metaSyncSource] != "NACOS" ||
+		in.Metadata[metaSyncSourceCluster] != srcCID {
 		return false
 	}
-	return in.Metadata[metaSyncSource] == "NACOS" && in.Metadata[metaSyncSourceCluster] == srcCID
+	// 新版本代注册实例必须匹配方向 ID，避免不同分组的相同 c_id 串归属。
+	// 空值仅兼容升级前遗留实例。
+	if owner := in.Metadata[metaSyncSourceDirection]; owner != "" && owner != directionID {
+		return false
+	}
+	return true
 }
 
 func instKey(in model.Instance) string {

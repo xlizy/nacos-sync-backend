@@ -33,15 +33,41 @@ func TestIsProxied(t *testing.T) {
 // TestIsOurs 验证「归属清理」核心：仅清理本方向（srcCID）产生的代注册实例，不越界到其它方向。
 func TestIsOurs(t *testing.T) {
 	ours := model.Instance{Metadata: map[string]string{metaSyncSource: "NACOS", metaSyncSourceCluster: "abc1"}}
-	if !isOurs(ours, "abc1") {
+	if !isOurs(ours, "abc1", "dirA") {
 		t.Fatal("匹配 srcCID 的代注册实例应归属本方向")
 	}
-	if isOurs(ours, "xyz9") {
+	if isOurs(ours, "xyz9", "dirA") {
 		t.Fatal("srcCID 不匹配的代注册实例不应归属本方向")
 	}
 	other := model.Instance{Metadata: map[string]string{metaSyncSource: "NACOS", metaSyncSourceCluster: "xyz9"}}
-	if isOurs(other, "abc1") {
+	if isOurs(other, "abc1", "dirA") {
 		t.Fatal("其它方向的代注册实例不应被本方向清理")
+	}
+	collision := model.Instance{Metadata: map[string]string{
+		metaSyncSource: "NACOS", metaSyncSourceCluster: "abc1", metaSyncSourceDirection: "dirB",
+	}}
+	if isOurs(collision, "abc1", "dirA") {
+		t.Fatal("相同 srcCID 但方向 ID 不同的实例不能被当前方向认领")
+	}
+	legacy := model.Instance{Metadata: map[string]string{
+		metaSyncSource: "NACOS", metaSyncSourceCluster: "abc1",
+	}}
+	if !isOurs(legacy, "abc1", "dirA") {
+		t.Fatal("无方向元数据的旧实例应兼容 srcCID 归属")
+	}
+}
+
+func TestDirectionManagesService(t *testing.T) {
+	static := &direction{Services: []string{"ORDER", "PAY"}}
+	if !directionManagesService(static, "ORDER") || directionManagesService(static, "USER") {
+		t.Fatal("静态方向必须严格遵循当前服务白名单")
+	}
+	dubbo := &direction{Dubbo: true}
+	if !directionManagesService(dubbo, "providers:com.example.Order") {
+		t.Fatal("Dubbo 方向应管理 providers 服务")
+	}
+	if directionManagesService(dubbo, "ORDER") {
+		t.Fatal("Dubbo 方向不应管理非 Dubbo 服务")
 	}
 }
 

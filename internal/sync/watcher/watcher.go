@@ -57,10 +57,11 @@ type poller struct {
 
 // Manager 配置同步轮询管理器。
 type Manager struct {
-	mgr     *config.Manager
-	logger  *zap.Logger
-	mu      sync.Mutex
-	pollers map[string]*poller
+	mgr         *config.Manager
+	logger      *zap.Logger
+	mu          sync.Mutex
+	reconcileMu sync.Mutex // 串行化慢速建连阶段，避免并发 reconcile 互相覆盖
+	pollers     map[string]*poller
 
 	// refresh 可在测试中替换（依赖注入）；生产路径为 refreshGroup。
 	refresh func(grpID string) error
@@ -119,6 +120,9 @@ func (w *Manager) desired(cfg *config.Config) map[string]config.NacosGroup {
 // 与所有 reconcile），本函数只在 w.mu 下做「停旧 + 收集待建列表」的轻量操作；实际的 DB 建连
 // （可能慢/不可达）移到锁外执行，建好后再加锁安装。
 func (w *Manager) reconcile(cfg *config.Config) {
+	w.reconcileMu.Lock()
+	defer w.reconcileMu.Unlock()
+
 	desired := w.desired(cfg)
 	w.mu.Lock()
 	// 停掉不再需要的。
@@ -162,11 +166,28 @@ func (w *Manager) reconcile(cfg *config.Config) {
 	for _, g := range toStart {
 		started[g.GrpID] = w.newPoller(g)
 	}
-	// 重新加锁安装；若并发 reconcile 已为该分组创建了新 poller，则丢弃本次新建（避免重复/泄漏）。
+	// DB 建连期间配置可能已再次变化。必须以 Manager 当前配置复核，而不能只相信
+	// 本次 reconcile 的旧快照；否则旧 DSN 的慢建连可能在新 DSN 已安装后反向覆盖它。
+	currentDesired := w.desired(w.mgr.Get())
 	w.mu.Lock()
 	for id, p := range started {
+		g, stillDesired := currentDesired[id]
+		if !stillDesired || g.DBDSN != p.dsn {
+			p.stop()
+			continue
+		}
 		if existing, ok := w.pollers[id]; ok {
-			existing.stop()
+			select {
+			case <-existing.done:
+				existing.stop()
+			default:
+				// 同一 DSN 的健康 poller 已被另一次 reconcile 安装，保留现有实例。
+				if existing.dsn == p.dsn {
+					p.stop()
+					continue
+				}
+				existing.stop()
+			}
 		}
 		w.pollers[id] = p
 	}

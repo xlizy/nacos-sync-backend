@@ -21,7 +21,7 @@ internal/nacos        ClientManager（(clusterID, namespace) 缓存 SDK 客户�
                       + localCache admin 刷新 + 分组 MySQL 指纹（config_info/gray）+ 连通性/鉴权探测
 internal/sync/configsync   new↔new 配置同步：监听点火 + 回声抑制（sha256，30s TTL）+ patrol/reconcile 自愈
 internal/sync/namingsync   服务同步（代注册）：ephemeral + syncSource 元数据防回环，
-                           1s 源实例快轮询 + TCP 探活 + 10s 全量对账 + 20s 孤儿清扫；
+                           1s Nacos 源实例快轮询 + 10s 全量对账 + 20s 孤儿清扫；
                            dubbo 动态方向：按 providers:/consumers: 前缀实时枚举源集群服务全量代注册
 internal/sync/watcher      配置同步辅助：3s 轮询目标 Nacos 后端 MySQL 指纹，变化刷新各节点 localCache
 internal/api          Hertz 控制面（组/集群 CRUD、同步开关、状态查询、按 IP 查服务、reload/reencrypt）
