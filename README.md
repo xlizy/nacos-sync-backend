@@ -34,9 +34,13 @@ configs/runtime-config.example.yaml  运行时配置 schema 示例（实际存�
 
 ## 运行
 ```bash
-# 后端（引导配置指定去哪连配置中心；运行时配置从配置中心拉取并热更新）
+# 主节点：默认 active，启动 NamingSync / ConfigSync / watcher
 go run ./cmd/server -c configs/config.yaml
-NACOS_SYNC_CONFIG=/path/to/config.yaml ./nacos-sync
+
+# 备用节点：只开放只读控制面与健康检查，不启动同步引擎
+NACOS_SYNC_MODE=standby NACOS_SYNC_CONFIG=/path/to/config.yaml ./nacos-sync
+
+# NACOS_SYNC_MODE 可选 active（默认）或 standby
 
 # 必需环境变量
 export NACOS_SYNC_SECRET_KEY=...   # ENC(...) 加解密主密钥（引导配置 secret-key 占位注入）
@@ -44,6 +48,17 @@ export NACOS_SYNC_SECRET_KEY=...   # ENC(...) 加解密主密钥（引导配置 
 export NACOS_SYNC_JWT_SECRET=...   # JWT 签名密钥（缺省回退 secret-key）
 export NACOS_SYNC_API_TOKEN=...    # 静态共享令牌（机器/脚本旁路鉴权）
 ```
+
+## 主备部署
+
+支持通过环境变量 `NACOS_SYNC_MODE` 选择运行模式：
+
+- `active`（默认）：启动 ConfigSync、NamingSync、watcher，并向 Nacos 注册工作节点。
+- `standby`：不启动任何同步引擎、不向 Nacos 注册工作节点；保留 HTTP 控制面与健康检查，写请求返回 HTTP 503，只允许查询及登录/登出。
+
+推荐部署 1 主 1 备：A 使用默认 `active`，B 设置 `NACOS_SYNC_MODE=standby`。故障切换必须先确认 A 进程已停止或主机已隔离，再将 B 切换为 `active`（重启进程生效）。A 恢复后保持停止，直到确认 B 已停止并完成反向切换。不要仅凭健康检查失败自动提升备用节点；网络分区或进程暂停可能造成双主。
+
+standby 模式不提供自动故障转移，也不构成分布式 fencing；同一时刻只能由运维流程保证一个 active 实例。
 
 ## 控制面 API（9696）
 
