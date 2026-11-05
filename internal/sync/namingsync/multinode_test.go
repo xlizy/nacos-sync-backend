@@ -3,6 +3,7 @@ package namingsync
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"testing"
 
