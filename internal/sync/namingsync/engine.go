@@ -1472,6 +1472,12 @@ func (e *Engine) fastPoll(ctx context.Context, rd *runningDir) {
 		svcs = d.Services
 	}
 
+	// A rebuilt destination connection has lost all publications owned by the
+	// previous connection. Force every configured service to publish its full
+	// desired snapshot, even when the local registered map itself did not change.
+	forceRepublish := rd.republishAll.Swap(false)
+	queryFailed := false
+
 	for _, svc := range svcs {
 		// 跳过同步服务自身的服务发现注册（appName）：它非业务服务，若被跨集群代注册，会把本机/
 		// 对端后端自注册实例误当作业务实例同步，导致目标集群出现本机 IP 的代注册残留。
@@ -1484,6 +1490,7 @@ func (e *Engine) fastPoll(ctx context.Context, rd *runningDir) {
 				zap.String("dir", d.ID), zap.String("svc", svc), zap.Error(err))
 			metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 			e.setErr(d.ID, err) // 暴露真实失败，避免 /api/naming-sync 的 last_error 被掩盖为空
+			queryFailed = true
 			continue
 		}
 		natives := filterNatives(srcList)
@@ -1532,7 +1539,15 @@ func (e *Engine) fastPoll(ctx context.Context, rd *runningDir) {
 		}
 		rd.mu.Unlock()
 
+		if forceRepublish {
+			// A synthetic add marks the service as touched; dispatchOps then
+			// publishes the complete current snapshot from rd.registered.
+			ops = append(ops, regOp{add: true, svc: svc})
+		}
 		e.dispatchOps(ctx, rd, ops)
+	}
+	if queryFailed && forceRepublish {
+		rd.republishAll.Store(true)
 	}
 	e.updateCounts(rd)
 }
@@ -1605,6 +1620,8 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 	} else {
 		svcs = d.Services
 	}
+
+	forceRepublish := rd.republishAll.Swap(false)
 
 	for _, svc := range svcs {
 		// 跳过同步服务自身的服务发现注册（appName）：它非业务服务，若被跨集群代注册，会把本机/
@@ -1690,7 +1707,13 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 		}
 		rd.mu.Unlock()
 
+		if forceRepublish {
+			ops = append(ops, regOp{add: true, svc: svc})
+		}
 		e.dispatchOps(ctx, rd, ops)
+	}
+	if failed && forceRepublish {
+		rd.republishAll.Store(true)
 	}
 	e.updateCounts(rd)
 	if failed {
