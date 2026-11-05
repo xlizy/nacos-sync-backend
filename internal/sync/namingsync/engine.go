@@ -8,7 +8,7 @@
 //   - 防回环：复制实例带 syncSource=NACOS，拉取源实例时过滤掉这些，避免 A→B→A 风暴；
 //     同时按 syncSourceCluster 归属，各方向仅清理自己产生的代注册实例，互不越界。
 //   - 生命周期（硬性要求：源节点不论优雅停还是崩溃停，代注册实例都要第一时间注销）：
-//     代注册实例采用 ephemeral=true（走 gRPC），每个实例绑定在独立的目标集群专属连接上。
+//     代注册实例采用 ephemeral=true（走 gRPC），每条同步方向共用一个目标集群专属连接。
 //     源实例消失时由两条路径收敛：
 //     ① 源实例列表快轮询：每 sourcePollInterval 通过 ClientManager.InstancesLive 使用独立 gRPC 查询
 //        拉取源端实时实例列表（绕过 SDK 本地缓存），与本方向 desired 集合对账并增删。
@@ -645,13 +645,37 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 	e.mu.Unlock()
 
 	// 每个同步方向只创建一个目标 Naming Client，业务实例和 Worker 心跳共用该连接。
-	rd := &runningDir{d:d,registered:make(map[string]regEntry),failCount:make(map[string]int),dead:make(map[string]regEntry),emptyStreak:make(map[string]int)}
-	e.mu.Lock();e.runs[d.ID]=rd;e.mu.Unlock()
-	if e.mgr==nil{e.setErr(d.ID,fmt.Errorf("nacos client manager is nil"));e.stopDir(d.ID);return}
-	client,err:=e.mgr.BuildDedicatedNamingClient(d.DstCID,d.Namespace)
-	if err!=nil{e.setErr(d.ID,fmt.Errorf("build direction naming client: %w",err));e.stopDir(d.ID);return}
-	rd.dstClient=client
-	if e.worker!=nil{if err:=e.worker.Ensure(client,d.DstCID,d.Namespace,d.ID);err!=nil{e.mgr.CloseDedicatedNamingClient(client);rd.dstClient=nil;e.setErr(d.ID,fmt.Errorf("register worker heartbeat: %w",err));e.stopDir(d.ID);return}}
+	rd := &runningDir{
+		d: d, registered: make(map[string]regEntry),
+		failCount: make(map[string]int), dead: make(map[string]regEntry),
+		emptyStreak: make(map[string]int),
+	}
+	e.mu.Lock()
+	e.runs[d.ID] = rd
+	e.mu.Unlock()
+
+	if e.mgr == nil {
+		e.setErr(d.ID, fmt.Errorf("nacos client manager is nil"))
+		e.stopDir(d.ID)
+		return
+	}
+	client, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
+	if err != nil {
+		e.setErr(d.ID, fmt.Errorf("build direction naming client: %w", err))
+		e.stopDir(d.ID)
+		return
+	}
+	rd.dstClient = client
+	if e.worker != nil {
+		if err := e.worker.Ensure(client, d.DstCID, d.Namespace, d.ID); err != nil {
+			e.mgr.CloseDedicatedNamingClient(client)
+			rd.dstClient = nil
+			e.setErr(d.ID, fmt.Errorf("register worker heartbeat: %w", err))
+			e.stopDir(d.ID)
+			return
+		}
+	}
+
 	// 初始全量对账：立即把已存在实例代注册出去。
 	e.syncService(ctx, rd)
 
@@ -1339,12 +1363,51 @@ type regOp struct {
 }
 
 // dispatchOps 按服务分组提交协程池任务：同一服务内串行，不同服务并发。
-func (e *Engine) dispatchOps(ctx context.Context,rd *runningDir,ops []regOp){
-	type task struct{add bool;svc string;in model.Instance};groups:=map[string][]task{};order:=[]string{};seen:=map[string]bool{}
-	appendTask:=func(it task){k:=fmt.Sprintf("%t:%s",it.add,regKey(it.svc,it.in));if seen[k]{return};seen[k]=true;if _,ok:=groups[it.svc];!ok{order=append(order,it.svc)};groups[it.svc]=append(groups[it.svc],it)}
-	for _,op:=range ops{if op.add&&op.in.Ip==""&&op.in.Port==0{rd.mu.Lock();for _,re:=range rd.registered{if re.svc==op.svc{appendTask(task{true,re.svc,re.inst})}};rd.mu.Unlock()}else{appendTask(task{op.add,op.svc,op.in})}}
+func (e *Engine) dispatchOps(ctx context.Context, rd *runningDir, ops []regOp) {
+	type task struct {
+		add bool
+		svc string
+		in model.Instance
+	}
+	groups := make(map[string][]task)
+	order := make([]string, 0)
+	seen := make(map[string]struct{}, len(ops))
+	appendTask := func(item task) {
+		key := fmt.Sprintf("%t:%s", item.add, regKey(item.svc, item.in))
+		if _, ok := seen[key]; ok { return }
+		seen[key] = struct{}{}
+		if _, ok := groups[item.svc]; !ok { order = append(order, item.svc) }
+		groups[item.svc] = append(groups[item.svc], item)
+	}
+	for _, op := range ops {
+		if op.add && op.in.Ip == "" && op.in.Port == 0 {
+			rd.mu.Lock()
+			for _, re := range rd.registered {
+				if re.svc == op.svc { appendTask(task{add:true, svc:re.svc, in:re.inst}) }
+			}
+			rd.mu.Unlock()
+			continue
+		}
+		appendTask(task{add:op.add, svc:op.svc, in:op.in})
+	}
 	var wg sync.WaitGroup
-	for _,svc:=range order{tasks:=groups[svc];wg.Add(1);run:=func(c context.Context){defer wg.Done();for _,it:=range tasks{if c.Err()!=nil{return};if it.add{e.registerProxied(c,rd,it.svc,it.in)}else{e.deregisterProxied(c,rd,it.svc,it.in)}}};if e.pl==nil{run(ctx)}else if err:=e.pl.Submit(ctx,run);err!=nil{wg.Done();rd.writeFailed.Store(true);e.setErr(rd.direction().ID,err)}}
+	for _, svc := range order {
+		tasks := groups[svc]
+		wg.Add(1)
+		run := func(taskCtx context.Context) {
+			defer wg.Done()
+			for _, item := range tasks {
+				if taskCtx.Err() != nil { return }
+				if item.add { e.registerProxied(taskCtx, rd, item.svc, item.in) } else { e.deregisterProxied(taskCtx, rd, item.svc, item.in) }
+			}
+		}
+		if e.pl == nil { run(ctx); continue }
+		if err := e.pl.Submit(ctx, run); err != nil {
+			wg.Done()
+			rd.writeFailed.Store(true)
+			e.setErr(rd.direction().ID, err)
+		}
+	}
 	wg.Wait()
 }
 
@@ -1618,33 +1681,129 @@ func (e *Engine) instanceNeedsUpdate(d *direction, src, dst model.Instance) bool
 }
 
 // ensureWorker 确认 Worker 心跳；与业务实例共用方向唯一客户端。
-func (e *Engine) ensureWorker(rd *runningDir)(bool,error){
-	if e.worker==nil{return true,nil};d:=rd.direction();rd.clientMu.Lock();client:=rd.dstClient;rd.clientMu.Unlock()
-	if client==nil{return false,fmt.Errorf("direction %s has no naming client",d.ID)}
-	if err:=e.worker.Ensure(client,d.DstCID,d.Namespace,d.ID);err==nil{return true,nil}else if !nacos.IsConnectionError(err){return false,err}else{
-		if e.mgr==nil{return false,fmt.Errorf("rebuild direction client: manager nil: %w",err)}
-		next,buildErr:=e.mgr.BuildDedicatedNamingClient(d.DstCID,d.Namespace);if buildErr!=nil{return false,fmt.Errorf("rebuild direction client: %w (previous: %v)",buildErr,err)}
-		if retryErr:=e.worker.Ensure(next,d.DstCID,d.Namespace,d.ID);retryErr!=nil{e.mgr.CloseDedicatedNamingClient(next);return false,fmt.Errorf("re-register Worker after reconnect: %w",retryErr)}
-		rd.clientMu.Lock();old:=rd.dstClient;rd.dstClient=next;rd.clientMu.Unlock();if old!=nil{e.mgr.CloseDedicatedNamingClient(old)};rd.republishAll.Store(true);return true,nil
+// 连接故障时整体重建方向客户端，并由本轮/下轮全量对账补回全部实例。
+func (e *Engine) ensureWorker(rd *runningDir) (bool, error) {
+	if e.worker == nil { return true, nil }
+	d := rd.direction()
+	rd.clientMu.Lock()
+	client := rd.dstClient
+	rd.clientMu.Unlock()
+	if client == nil { return false, fmt.Errorf("direction %s has no naming client", d.ID) }
+	if err := e.worker.Ensure(client, d.DstCID, d.Namespace, d.ID); err == nil {
+		return true, nil
+	} else if !nacos.IsConnectionError(err) {
+		return false, err
+	} else {
+		if e.mgr == nil { return false, fmt.Errorf("rebuild direction client: manager nil: %w", err) }
+		replacement, buildErr := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
+		if buildErr != nil { return false, fmt.Errorf("rebuild direction client: %w (previous: %v)", buildErr, err) }
+		if retryErr := e.worker.Ensure(replacement, d.DstCID, d.Namespace, d.ID); retryErr != nil {
+			e.mgr.CloseDedicatedNamingClient(replacement)
+			return false, fmt.Errorf("re-register Worker after reconnect: %w", retryErr)
+		}
+		rd.clientMu.Lock()
+		old := rd.dstClient
+		rd.dstClient = replacement
+		rd.clientMu.Unlock()
+		if old != nil { e.mgr.CloseDedicatedNamingClient(old) }
+		// 关闭旧 ephemeral 连接会摘除其发布实例；syncService 随后强制重发完整 desired 集合。
+		rd.republishAll.Store(true)
+		return true, nil
 	}
 }
 
 // registerProxied 通过方向共享客户端注册一个源实例。
-func (e *Engine) registerProxied(ctx context.Context,rd *runningDir,svc string,in model.Instance){
-	if ctx.Err()!=nil{return};rk:=regKey(svc,in);rd.mu.Lock();if rd.stopped{rd.mu.Unlock();return};d:=rd.d;rd.mu.Unlock()
-	md:=e.proxiedMetadata(d,in);encoded,err:=json.Marshal(md);if err==nil&&len(encoded)>1024{err=fmt.Errorf("proxied metadata exceeds Nacos 1024-byte limit dir=%q service=%q instance=%q metadata_bytes=%d limit=1024",d.ID,svc,instKey(in),len(encoded))}
-	if err!=nil{rd.mu.Lock();rd.failCount[rk]++;rd.mu.Unlock();rd.writeFailed.Store(true);metrics.SyncErrors.WithLabelValues(d.ID,"naming").Inc();e.setErr(d.ID,err);e.logger.Error("register proxied instance rejected before Nacos request",zap.String("dir",d.ID),zap.String("svc",svc),zap.String("instance",instKey(in)),zap.Error(err));return}
-	rd.clientMu.Lock();client:=rd.dstClient;rd.clientMu.Unlock();if client==nil{err=fmt.Errorf("direction %s has no naming client",d.ID)}else{var ok bool;ok,err=client.RegisterInstance(vo.RegisterInstanceParam{ServiceName:svc,GroupName:defaultGroup,Ip:in.Ip,Port:in.Port,Weight:in.Weight,Enable:in.Enable,Healthy:in.Healthy,Ephemeral:true,Metadata:md,ClusterName:in.ClusterName});if err==nil&&!ok{err=fmt.Errorf("nacos rejected register instance")}}
-	if err!=nil{err=fmt.Errorf("register proxied instance failed target_cluster=%q namespace=%q service=%q instance=%s: %w",d.DstCID,d.Namespace,svc,instKey(in),err);rd.mu.Lock();rd.failCount[rk]++;rd.mu.Unlock();rd.writeFailed.Store(true);metrics.SyncErrors.WithLabelValues(d.ID,"naming").Inc();e.setErr(d.ID,err);e.logger.Error("register proxied instance failed",zap.String("dir",d.ID),zap.String("svc",svc),zap.String("instance",instKey(in)),zap.Error(err));return}
-	rd.mu.Lock();delete(rd.failCount,rk);rd.mu.Unlock();metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
+func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
+	if ctx.Err() != nil { return }
+	rk := regKey(svc, in)
+	rd.mu.Lock()
+	if rd.stopped { rd.mu.Unlock(); return }
+	d := rd.d
+	rd.mu.Unlock()
+
+	metadata := e.proxiedMetadata(d, in)
+	encoded, err := json.Marshal(metadata)
+	if err == nil && len(encoded) > 1024 {
+		err = fmt.Errorf("proxied metadata exceeds Nacos 1024-byte limit dir=%q service=%q instance=%q metadata_bytes=%d limit=1024",
+			d.ID, svc, instKey(in), len(encoded))
+	}
+	if err != nil {
+		rd.mu.Lock(); rd.failCount[rk]++; rd.mu.Unlock()
+		rd.writeFailed.Store(true)
+		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
+		e.setErr(d.ID, err)
+		e.logger.Error("register proxied instance rejected before Nacos request",
+			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)), zap.Error(err))
+		return
+	}
+
+	rd.clientMu.Lock()
+	client := rd.dstClient
+	rd.clientMu.Unlock()
+	if client == nil {
+		err = fmt.Errorf("direction %s has no naming client", d.ID)
+	} else {
+		var ok bool
+		ok, err = client.RegisterInstance(vo.RegisterInstanceParam{
+			ServiceName: svc, GroupName: defaultGroup,
+			Ip: in.Ip, Port: in.Port, Weight: in.Weight,
+			Enable: in.Enable, Healthy: in.Healthy, Ephemeral: true,
+			Metadata: metadata, ClusterName: in.ClusterName,
+		})
+		if err == nil && !ok { err = fmt.Errorf("nacos rejected register instance") }
+	}
+	if err != nil {
+		err = fmt.Errorf("register proxied instance failed target_cluster=%q namespace=%q service=%q instance=%s: %w",
+			d.DstCID, d.Namespace, svc, instKey(in), err)
+		rd.mu.Lock(); rd.failCount[rk]++; rd.mu.Unlock()
+		rd.writeFailed.Store(true)
+		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
+		e.setErr(d.ID, err)
+		e.logger.Error("register proxied instance failed",
+			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)), zap.Error(err))
+		return
+	}
+	rd.mu.Lock(); delete(rd.failCount, rk); rd.mu.Unlock()
+	e.logger.Debug("register proxied instance ok",
+		zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)))
+	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 }
 
 // deregisterProxied 注销单实例后，重新发布同服务剩余期望实例，保持 service 级 redo cache 一致。
-func (e *Engine) deregisterProxied(ctx context.Context,rd *runningDir,svc string,in model.Instance){
-	if ctx.Err()!=nil{return};d:=rd.direction();rd.clientMu.Lock();client:=rd.dstClient;rd.clientMu.Unlock();if client==nil{err:=fmt.Errorf("direction %s has no naming client",d.ID);rd.writeFailed.Store(true);e.setErr(d.ID,err);return}
-	ok,err:=client.DeregisterInstance(vo.DeregisterInstanceParam{ServiceName:svc,GroupName:defaultGroup,Ip:in.Ip,Port:in.Port,Ephemeral:true,Cluster:in.ClusterName});if err==nil&&!ok{err=fmt.Errorf("nacos rejected deregister instance")};if err!=nil{rd.writeFailed.Store(true);e.setErr(d.ID,fmt.Errorf("deregister proxied instance service=%q instance=%q: %w",svc,instKey(in),err));metrics.SyncErrors.WithLabelValues(d.ID,"naming").Inc();return}
-	rd.mu.Lock();remaining:=[]model.Instance{};for _,re:=range rd.registered{if re.svc==svc&&regKey(svc,re.inst)!=regKey(svc,in){remaining=append(remaining,re.inst)}};rd.mu.Unlock()
-	for _,cur:=range remaining{if ctx.Err()!=nil{return};e.registerProxied(ctx,rd,svc,cur)}
+// 同一服务的操作由 dispatchOps 串行化，避免注销与重发互相覆盖。
+func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
+	if ctx.Err() != nil { return }
+	d := rd.direction()
+	rd.clientMu.Lock()
+	client := rd.dstClient
+	rd.clientMu.Unlock()
+	if client == nil {
+		err := fmt.Errorf("direction %s has no naming client", d.ID)
+		rd.writeFailed.Store(true); e.setErr(d.ID, err); return
+	}
+	ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
+		ServiceName: svc, GroupName: defaultGroup,
+		Ip: in.Ip, Port: in.Port, Ephemeral: true, Cluster: in.ClusterName,
+	})
+	if err == nil && !ok { err = fmt.Errorf("nacos rejected deregister instance") }
+	if err != nil {
+		rd.writeFailed.Store(true)
+		e.setErr(d.ID, fmt.Errorf("deregister proxied instance service=%q instance=%q: %w", svc, instKey(in), err))
+		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
+		e.logger.Error("deregister proxied instance failed",
+			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)), zap.Error(err))
+		return
+	}
+	rd.mu.Lock()
+	remaining := make([]model.Instance, 0)
+	for _, re := range rd.registered {
+		if re.svc == svc && regKey(svc, re.inst) != regKey(svc, in) { remaining = append(remaining, re.inst) }
+	}
+	rd.mu.Unlock()
+	for _, current := range remaining {
+		if ctx.Err() != nil { return }
+		e.registerProxied(ctx, rd, svc, current)
+	}
 	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 }
 
@@ -1663,14 +1822,14 @@ func (e *Engine) setErr(id string, err error) {
 
 // updateCounts 把方向当前跟踪/代注册的实例数刷到可观测 gauge（供状态接口排查）。
 func (e *Engine) updateCounts(rd *runningDir) {
-	dirID := rd.direction().ID // 走锁读取方向 ID（配置热更新可能替换 rd.d）
+	dirID := rd.direction().ID
 	rd.mu.Lock()
 	tracked := len(rd.registered) + len(rd.dead)
-	rd.mu.Unlock()
-	rd.clientMu.Lock()
 	proxied := 0
-	for rk := range rd.registered { if rd.failCount[rk] == 0 { proxied++ } }
-	rd.clientMu.Unlock()
+	for rk := range rd.registered {
+		if rd.failCount[rk] == 0 { proxied++ }
+	}
+	rd.mu.Unlock()
 	e.mu.Lock()
 	e.lastSrcCount[dirID] = tracked
 	e.lastRegCount[dirID] = proxied
@@ -1721,7 +1880,7 @@ func sourceViewOfProxy(in model.Instance) model.Instance {
 	metadata := make(map[string]string, len(in.Metadata))
 	for key, value := range in.Metadata {
 		switch key {
-		case metaSyncSource, metaSyncSourceCluster:
+		case metaSyncSource, metaSyncSourceCluster, "syncSourceDirection":
 			continue
 		default:
 			metadata[key] = value
