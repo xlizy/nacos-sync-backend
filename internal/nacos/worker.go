@@ -92,14 +92,18 @@ func hasOwnWorker(instances []model.Instance, want vo.RegisterInstanceParam) boo
 }
 
 // WorkerScopes returns every direction currently maintained by at least one healthy Worker.
+func validWorkerInstance(in model.Instance) bool {
+	scope := in.Metadata[workerDirectionMeta]
+	return scope != "" && in.Ephemeral && in.Enable && in.Healthy &&
+		in.Metadata[workerIDMeta] == fmt.Sprintf("%s:%d", in.Ip, in.Port) &&
+		in.ClusterName == workerCluster(scope)
+}
+
 func WorkerScopes(instances []model.Instance) map[string]bool {
 	out := make(map[string]bool)
 	for _, in := range instances {
-		if !in.Ephemeral || !in.Enable || !in.Healthy || in.Metadata[workerIDMeta] == "" {
-			continue
-		}
-		if scope := in.Metadata[workerDirectionMeta]; scope != "" && in.ClusterName == workerCluster(scope) {
-			out[scope] = true
+		if validWorkerInstance(in) {
+			out[in.Metadata[workerDirectionMeta]] = true
 		}
 	}
 	return out
@@ -112,9 +116,7 @@ func HasOtherWorker(instances []model.Instance, scope string, self *DirectionWor
 		return false
 	}
 	for _, in := range instances {
-		if !in.Ephemeral || !in.Enable || !in.Healthy ||
-			in.Metadata[workerDirectionMeta] != scope || in.Metadata[workerIDMeta] == "" ||
-			in.ClusterName != workerCluster(scope) {
+		if !validWorkerInstance(in) || in.Metadata[workerDirectionMeta] != scope {
 			continue
 		}
 		if in.Ip == self.agentIP && in.Port == self.agentPort && in.Metadata[workerIDMeta] == self.workerID {
