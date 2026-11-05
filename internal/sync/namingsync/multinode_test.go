@@ -2,9 +2,9 @@ package namingsync
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"testing"
-	"time"
 
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/naming_client"
 	"github.com/nacos-group/nacos-sdk-go/v2/model"
@@ -66,7 +66,7 @@ func TestTwoNodesPublishSameDirectionConcurrently(t *testing.T) {
 			if _, ok := in.Metadata["syncSourceAgent"]; ok {
 				t.Fatalf("node-specific metadata must not be published: %+v", in.Metadata)
 			}
-			out = append(out, in.Ip+":"+string(rune(in.Port)))
+			out = append(out, fmt.Sprintf("%s:%d", in.Ip, in.Port))
 		}
 		sort.Strings(out)
 		return out
@@ -87,5 +87,4 @@ func TestRapidSourceRestartUpdatesChangedSpecification(t *testing.T) {
 	if !sameSourceSpec(restarted, restarted) {
 		t.Fatal("an unchanged source snapshot must remain idempotent")
 	}
-	_ = time.Second // keep this test's timing intent explicit without sleeps/flaky assertions
 }
