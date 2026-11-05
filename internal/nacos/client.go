@@ -495,13 +495,18 @@ func isConnError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
+	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not connected") ||
-		strings.Contains(msg, "UNHEALTHY") ||
-		strings.Contains(msg, "STARTING") ||
+		strings.Contains(msg, "unhealthy") ||
+		strings.Contains(msg, "starting") ||
 		strings.Contains(msg, "client is closed") ||
 		strings.Contains(msg, "no available server") ||
-		strings.Contains(msg, "Connection refused")
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "transport is closing") ||
+		strings.Contains(msg, "connection is closing") ||
+		strings.Contains(msg, "rpc error: code = unavailable")
 }
 
 // IsConnectionError exposes the SDK connection-failure classifier to sync engines
