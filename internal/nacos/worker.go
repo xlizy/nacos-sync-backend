@@ -84,7 +84,7 @@ func hasOwnWorker(instances []model.Instance, want vo.RegisterInstanceParam) boo
 			in.ClusterName == want.ClusterName &&
 			in.Metadata[workerDirectionMeta] == want.Metadata[workerDirectionMeta] &&
 			in.Metadata[workerIDMeta] == want.Metadata[workerIDMeta] &&
-			in.Enable && in.Healthy {
+			in.Ephemeral && in.Enable && in.Healthy {
 			return true
 		}
 	}
