@@ -41,7 +41,14 @@ type retryTargetClient struct {
 	config_client.IConfigClient
 	mu       sync.Mutex
 	failNext bool
+	current  string
 	published []string
+}
+
+func (c *retryTargetClient) GetConfig(vo.ConfigParam) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.current, nil
 }
 
 func (c *retryTargetClient) PublishConfig(p vo.ConfigParam) (bool, error) {
@@ -60,7 +67,7 @@ func TestForwardDoesNotPublishStaleEventAfterSourceRefreshFailure(t *testing.T) 
 		{err: errors.New("source temporarily unavailable")},
 		{content: "fresh-source-value"},
 	}}
-	tgt := &retryTargetClient{failNext: true}
+	tgt := &retryTargetClient{failNext: true, current: "target-old"}
 	e := &Engine{logger: zap.NewNop()}
 	link := config.SyncLink{From: "source", To: "target", Kind: "config"}
 
@@ -81,5 +88,24 @@ func TestForwardDoesNotPublishStaleEventAfterSourceRefreshFailure(t *testing.T) 
 	}
 	if src.calls != 2 {
 		t.Fatalf("expected two source refresh attempts, got %d", src.calls)
+	}
+}
+
+func TestForwardSkipsPublishWhenTargetAlreadyHasSameContent(t *testing.T) {
+	src := &retrySourceClient{}
+	tgt := &retryTargetClient{current: "same-content"}
+	e := &Engine{logger: zap.NewNop()}
+	link := config.SyncLink{From: "source", To: "target", Kind: "config"}
+
+	if err := e.forward(context.Background(), link, "public", "DEFAULT_GROUP", "app.yaml", "same-content", src, tgt); err != nil {
+		t.Fatalf("forward should treat matching target as success: %v", err)
+	}
+	tgt.mu.Lock()
+	defer tgt.mu.Unlock()
+	if len(tgt.published) != 0 {
+		t.Fatalf("matching target content must not be republished, got %v", tgt.published)
+	}
+	if _, ok := e.pushed.Load(pushKey("source", "target", "public", "DEFAULT_GROUP", "app.yaml")); !ok {
+		t.Fatal("skipped duplicate publish must still record local echo")
 	}
 }
