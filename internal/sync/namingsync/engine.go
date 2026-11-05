@@ -665,7 +665,6 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 	// Worker 心跳使用独立连接，不与数据面目标客户端共享生命周期。
 	workerCli, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
 	if err != nil {
-		e.mgr.CloseDedicatedNamingClient(dstCli)
 		e.setErr(d.ID, fmt.Errorf("build worker heartbeat client: %w", err))
 		e.stopDir(d.ID)
 		return
@@ -1843,7 +1842,7 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 	if err != nil {
 		err = fmt.Errorf("register proxied instance failed target_cluster=%q namespace=%q service=%q group=%q instance=%s: %w",
 			d.DstCID, d.Namespace, svc, defaultGroup, instKey(in), err)
-		if created && e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
+		if client != legacyClient && e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
 		rd.clientMu.Lock()
 		if rd.instanceClients[rk] == client { delete(rd.instanceClients, rk) }
 		rd.clientMu.Unlock()
