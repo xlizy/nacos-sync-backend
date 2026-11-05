@@ -1861,8 +1861,8 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 }
 
-// deregisterProxied 通过关闭该实例独占的 gRPC 客户端注销 ephemeral 实例。
-// 不调用 SDK DeregisterInstance：其服务端语义是删除该客户端对整个 service 的 publisher。
+// deregisterProxied 通过实例独占客户端执行单实例注销，再关闭连接清除 SDK redo cache。
+// 虽然 SDK DeregisterInstance 删除的是该客户端对整个 service 的 publisher，但每个客户端只发布一个实例。
 func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
 	if ctx.Err() != nil { return }
 	d := rd.direction()
@@ -1873,8 +1873,19 @@ func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc stri
 	legacyClient := rd.dstClient
 	rd.clientMu.Unlock()
 	if client != nil {
+		// 此客户端只发布当前一个实例，因此服务级 DeregisterInstance 不会误删同服务的其他实例。
+		ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
+			ServiceName: svc, GroupName: defaultGroup, Ip: in.Ip, Port: in.Port,
+			Ephemeral: true, Cluster: in.ClusterName,
+		})
+		if err == nil && !ok { err = fmt.Errorf("nacos rejected deregister instance") }
+		if err != nil {
+			e.setErr(d.ID, err)
+			e.logger.Error("deregister proxied instance failed", zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)), zap.Error(err))
+			metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
+		}
+		// 即使 RPC 失败也关闭独占连接，确保 SDK 不会在重连时重新发布该实例。
 		if e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
-		e.logger.Debug("deregister proxied instance by closing publisher", zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)))
 		metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 		return
 	}
