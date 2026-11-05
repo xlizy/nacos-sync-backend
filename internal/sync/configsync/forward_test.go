@@ -63,3 +63,23 @@ func TestForwardUsesCurrentSourceInsteadOfStaleCallbackPayload(t *testing.T) {
 		t.Fatalf("published stale callback payload %q, want current source value", got)
 	}
 }
+
+func TestForwardPublishesWhenTargetContentAlreadyMatches(t *testing.T) {
+	src := &forwardConfigClient{content: "same-value"}
+	tgt := &forwardConfigClient{content: "same-value"}
+	e := &Engine{logger: zap.NewNop()}
+
+	err := e.forward(
+		context.Background(),
+		config.SyncLink{From: "source", To: "target", Kind: "config"},
+		"namespace", "DEFAULT_GROUP", "application.yaml",
+		"same-value", src, tgt,
+	)
+	if err != nil {
+		t.Fatalf("forward returned error: %v", err)
+	}
+	if len(tgt.published) != 1 {
+		t.Fatalf("publish count = %d, want 1 to notify target-cluster listeners", len(tgt.published))
+	}
+}
+
