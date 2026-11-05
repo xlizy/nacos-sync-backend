@@ -525,10 +525,10 @@ func (e *Engine) onChange(ctx context.Context, link config.SyncLink, ns, group, 
 }
 
 // forward 真正向目标发布（或删除）并记入回声表。
-// 失败时按指数退避重试（有界次数），且每次重试前**重新拉取源端最新内容**：
-// 集群共享同一 config DB，用事件时刻的旧内容重试可能把已被再次修改的 DB 值改回旧值。
-// 成功后 recordPush 内容以实际发布内容为准。返回最终错误供调用方聚合判断（此前静默失败
-// 会造成目标端长期不通知且无人知晓，P1「发布失败无重试」）。
+// 每次尝试（包括首次）都重新读取源端最新内容：监听回调经并发池异步执行，
+// 同一 DataId/Group 的旧事件可能晚于新事件执行，不能把回调 payload 当作当前值。
+// 失败时按指数退避重试（有界次数）；读取源端失败时绝不回退使用旧 payload。
+// 成功后 recordPush 内容以实际发布内容为准。返回最终错误供调用方聚合判断。
 func (e *Engine) forward(ctx context.Context, link config.SyncLink, ns, group, dataId, data string, src, tgt config_client.IConfigClient) error {
 	const maxAttempts = 3
 	var lastErr error
