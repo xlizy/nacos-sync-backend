@@ -473,18 +473,8 @@ func (e *Engine) refreshRunningDirection(d *direction) {
 	if len(removed) > 0 {
 		e.logger.Info("direction service list changed, cleaning removed services",
 			zap.String("dir", d.ID), zap.Int("count", len(removed)))
-
-		// DeregisterInstance clears this SDK connection's redo snapshot for the
-		// whole service, not just the removed endpoint. Republish the complete
-		// remaining desired set once per affected service, otherwise a later
-		// reconnect silently drops retained instances.
-		affected := make(map[string]struct{})
 		for _, re := range removed {
-			affected[re.svc] = struct{}{}
 			e.deregisterProxied(e.ctx, rd, re.svc, re.inst)
-		}
-		for svc := range affected {
-			e.registerServiceProxied(e.ctx, rd, svc)
 		}
 	}
 }
