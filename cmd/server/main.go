@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -86,25 +85,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// active 是默认模式，保持原有单节点行为；standby 只提供只读控制面与健康检查，
-	// 不启动任何同步引擎，也不注册为同步工作节点。切换必须先确认 active 已停止。
-	mode := strings.ToLower(strings.TrimSpace(os.Getenv("NACOS_SYNC_MODE")))
-	if mode == "" {
-		mode = "active"
-	}
-	if mode != "active" && mode != "standby" {
-		logger.Fatal("invalid NACOS_SYNC_MODE (allowed: active, standby)", zap.String("mode", mode))
-	}
-	standby := mode == "standby"
-	if standby {
-		logger.Warn("running in STANDBY mode: sync engines are disabled; control-plane writes are rejected")
-	} else {
-		cfgEngine.Start(ctx)
-		nameEngine.Start(ctx)
-		syncWatcher.Start(ctx)
-	}
+	// Active-Active：每个实例都启动完整同步引擎与 watcher。
+	// 多实例通过 Worker 心跳协同维护方向，不进行 Leader 选举或主备切换。
+	cfgEngine.Start(ctx)
+	nameEngine.Start(ctx)
+	syncWatcher.Start(ctx)
 
-	srv := api.NewWithReadOnly(mgr, clientMgr, cfgEngine, nameEngine, syncWatcher, logger, standby)
+	srv := api.New(mgr, clientMgr, cfgEngine, nameEngine, syncWatcher, logger)
 	if err := srv.Run(ctx); err != nil {
 		logger.Fatal("http server run failed", zap.Error(err))
 	}
@@ -129,16 +116,10 @@ func main() {
 		}
 	}
 
-	// 启动后向 Nacos 注册中心注册自身（reg-namespace + appname），进程退出时注销。
-	deregister := func() {}
-	if !standby {
-		var rerr error
-		deregister, rerr = registry.Register(ctx, boot, api.DefaultHTTPPort, logger)
-		if rerr != nil {
-			logger.Warn("service registration init failed", zap.Error(rerr))
-		}
-	} else {
-		logger.Info("standby mode: skip Nacos worker self-registration")
+	// 每个 Active 实例都向 Nacos 注册中心登记自身（reg-namespace + appname），退出时注销。
+	deregister, rerr := registry.Register(ctx, boot, api.DefaultHTTPPort, logger)
+	if rerr != nil {
+		logger.Warn("service registration init failed", zap.Error(rerr))
 	}
 	defer deregister()
 
