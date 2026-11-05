@@ -1921,8 +1921,10 @@ func (e *Engine) updateCounts(rd *runningDir) {
 	dirID := rd.direction().ID // 走锁读取方向 ID（配置热更新可能替换 rd.d）
 	rd.mu.Lock()
 	tracked := len(rd.registered) + len(rd.dead)
-	proxied := len(rd.registered)
 	rd.mu.Unlock()
+	rd.clientMu.Lock()
+	proxied := len(rd.instanceClients)
+	rd.clientMu.Unlock()
 	e.mu.Lock()
 	e.lastSrcCount[dirID] = tracked
 	e.lastRegCount[dirID] = proxied
