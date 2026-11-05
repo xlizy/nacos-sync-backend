@@ -71,6 +71,54 @@ func TestDirectionManagesService(t *testing.T) {
 	}
 }
 
+func TestPruneOrphanSeen(t *testing.T) {
+	e := &Engine{orphanSeen: make(map[string]time.Time)}
+	scan := sweepScan{dstGrp: "g", dstCID: "dst", ns: ""}
+	keep := scan.label() + "\x00" + regKey("ORDER", model.Instance{Ip: "10.0.0.1", Port: 8080})
+	remove := scan.label() + "\x00" + regKey("PAY", model.Instance{Ip: "10.0.0.2", Port: 8080})
+	otherScope := "g/other/\x00" + regKey("USER", model.Instance{Ip: "10.0.0.3", Port: 8080})
+	e.orphanSeen[keep] = time.Now()
+	e.orphanSeen[remove] = time.Now()
+	e.orphanSeen[otherScope] = time.Now()
+
+	e.pruneOrphanSeen(scan, map[string]struct{}{keep: {}})
+	if _, ok := e.orphanSeen[keep]; !ok {
+		t.Fatal("currently observed orphan must retain its grace-period timestamp")
+	}
+	if _, ok := e.orphanSeen[remove]; ok {
+		t.Fatal("orphan no longer present in a complete scan must be pruned")
+	}
+	if _, ok := e.orphanSeen[otherScope]; !ok {
+		t.Fatal("pruning one target must not affect another target's timestamps")
+	}
+}
+
+type rejectingDeregisterClient struct {
+	stubNamingClient
+	ok  bool
+	err error
+}
+
+func (c rejectingDeregisterClient) DeregisterInstance(vo.DeregisterInstanceParam) (bool, error) {
+	return c.ok, c.err
+}
+
+func TestDeregisterOrphanRequiresNacosAcceptance(t *testing.T) {
+	e := &Engine{logger: zap.NewNop()}
+	target := sweepTarget{dstGrp: "g", dstCID: "dst", service: "ORDER"}
+	inst := model.Instance{Ip: "10.0.0.1", Port: 8080, ClusterName: "DEFAULT"}
+
+	if e.deregisterOrphan(rejectingDeregisterClient{ok: false}, target, inst) {
+		t.Fatal("false,nil from Nacos must not be treated as successful deregistration")
+	}
+	if e.deregisterOrphan(rejectingDeregisterClient{err: context.DeadlineExceeded}, target, inst) {
+		t.Fatal("deregistration error must be reported as failure")
+	}
+	if !e.deregisterOrphan(rejectingDeregisterClient{ok: true}, target, inst) {
+		t.Fatal("accepted deregistration must be reported as success")
+	}
+}
+
 func TestInstKey(t *testing.T) {
 	in := model.Instance{Ip: "192.168.0.100", Port: 8080, ClusterName: "DEFAULT"}
 	if got := instKey(in); got != "192.168.0.100:8080:DEFAULT" {
