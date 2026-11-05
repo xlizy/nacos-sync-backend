@@ -337,6 +337,63 @@ func (c captureNamingClient) BatchRegisterInstance(p vo.BatchRegisterInstancePar
 	return true, nil
 }
 
+type batchDeregisterNamingClient struct {
+	naming_client.INamingClient
+	batches chan vo.BatchRegisterInstanceParam
+	removed chan vo.DeregisterInstanceParam
+}
+
+func (c batchDeregisterNamingClient) BatchRegisterInstance(p vo.BatchRegisterInstanceParam) (bool, error) {
+	c.batches <- p
+	return true, nil
+}
+
+func (c batchDeregisterNamingClient) DeregisterInstance(p vo.DeregisterInstanceParam) (bool, error) {
+	c.removed <- p
+	return true, nil
+}
+
+// TestDispatchOpsRepublishesRemainingBatch verifies the SDK behavior that a
+// single deregistration invalidates the whole per-service redo cache: after
+// deleting one desired instance, the engine must batch-publish all survivors.
+func TestDispatchOpsRepublishesRemainingBatch(t *testing.T) {
+	client := batchDeregisterNamingClient{
+		batches: make(chan vo.BatchRegisterInstanceParam, 1),
+		removed: make(chan vo.DeregisterInstanceParam, 1),
+	}
+	e := &Engine{logger: zap.NewNop()}
+	removed := model.Instance{Ip: "10.0.0.1", Port: 8080, Weight: 1, Enable: true, Healthy: true}
+	remaining := model.Instance{Ip: "10.0.0.2", Port: 8080, Weight: 1, Enable: true, Healthy: true}
+	rd := &runningDir{
+		d: &direction{ID: "g/s->g/d/", SrcCID: "s", DstCID: "d"},
+		dstClient: client,
+		registered: map[string]regEntry{
+			regKey("TEST-SVC", remaining): {svc: "TEST-SVC", inst: remaining},
+		},
+		failCount: map[string]int{},
+		dead: map[string]regEntry{},
+	}
+
+	e.dispatchOps(context.Background(), rd, []regOp{{add: false, svc: "TEST-SVC", in: removed}})
+
+	select {
+	case got := <-client.removed:
+		if got.Ip != removed.Ip {
+			t.Fatalf("deregistered %s, want %s", got.Ip, removed.Ip)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected deregistration before batch republish")
+	}
+	select {
+	case got := <-client.batches:
+		if len(got.Instances) != 1 || got.Instances[0].Ip != remaining.Ip {
+			t.Fatalf("expected full remaining publication, got %+v", got.Instances)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected remaining service instances to be batch-published")
+	}
+}
+
 // TestRegisterProxiedPublishesWholeService verifies that a single recovery/add
 // operation publishes every locally desired instance for the service in one batch,
 // and that node-specific metadata cannot cause Active-Active nodes to overwrite it.
