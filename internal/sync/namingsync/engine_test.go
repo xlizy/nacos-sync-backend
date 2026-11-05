@@ -170,7 +170,7 @@ func TestRegKeyRoundTrip(t *testing.T) {
 		if gotSvc != tt.svc {
 			t.Fatalf("splitRegKey svc = %q, want %q", gotSvc, tt.svc)
 		}
-		if gotIk != instKey(tt.in) {
+		if gotIk != instanceSpecKey(tt.in) {
 			t.Fatalf("splitRegKey instKey = %q, want %q", gotIk, instKey(tt.in))
 		}
 	}
@@ -186,8 +186,41 @@ func TestFilterNatives(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("filterNatives len = %d, want 1", len(got))
 	}
-	if _, ok := got[instKey(src[0])]; !ok {
+	if _, ok := got[instanceSpecKey(src[0])]; !ok {
 		t.Fatal("原始业务实例应被保留")
+	}
+}
+
+// TestFilterNativesPreservesSameEndpointPublisherVariants verifies that two
+// publisher clients may expose the same endpoint with different metadata.
+// Those records must not collapse into one local desired-state entry.
+func TestFilterNativesPreservesSameEndpointPublisherVariants(t *testing.T) {
+	base := model.Instance{
+		Ip: "10.0.0.8", Port: 8080, ClusterName: "DEFAULT",
+		Weight: 1, Enable: true, Healthy: true,
+	}
+	first := base
+	first.Metadata = map[string]string{"version": "v1", "zone": "a"}
+	second := base
+	second.Metadata = map[string]string{"version": "v2", "zone": "b"}
+
+	got := filterNatives([]model.Instance{first, second})
+	if len(got) != 2 {
+		t.Fatalf("same endpoint with different publisher metadata collapsed: got %d records", len(got))
+	}
+	if regKey("ORDER", first) == regKey("ORDER", second) {
+		t.Fatal("different publisher specifications must have distinct registration keys")
+	}
+
+	proxy := second
+	proxy.Metadata = map[string]string{
+		"version": "v2", "zone": "b",
+		metaSyncSource: "NACOS",
+		metaSyncSourceCluster: "src",
+		metaSyncSourceDirection: "g/src->g/dst/",
+	}
+	if got := instanceSpecKey(sourceViewOfProxy(proxy)); got != instanceSpecKey(second) {
+		t.Fatal("proxy ownership metadata must be stripped when matching a target publisher to its source spec")
 	}
 }
 
