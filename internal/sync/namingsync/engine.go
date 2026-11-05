@@ -76,7 +76,7 @@ const (
 	dirCleanupTimeout   = 15 * time.Second // ④ 单方向停用/删除时，注销其目标代注册实例的每方向等待上限（reconcile 触发）
 	cleanupTotalTimeout = 30 * time.Second // ④ Stop 全程注销所有方向代注册实例的全局等待上限
 	probeConcurrency    = 64               // ② 单引擎全局并发探活上限：把"每实例一个 goroutine"限流为有限并发，削去 400 节点下的 goroutine 风暴
-	cleanupConcurrency  = 64               // ④ 单方向并发注销上限，避免数百实例瞬时打满目标 Nacos
+
 
 	// ---- dubbo 动态方向参数 ----
 	// dubboDiscoCache：动态服务枚举结果的共享有效期。fastPoll（1s）在有效期内直接复用缓存，
@@ -163,7 +163,7 @@ type runningDir struct {
 	opMu       sync.Mutex
 	mu         sync.Mutex
 	registered map[string]regEntry // 当前已在目标代注册的源原生实例（快手路径的“应然”集合），key=regKey
-	failCount  map[string]int      // 各源实例连续 TCP 探活失败次数，key=regKey
+	failCount  map[string]int      // 各实例注册失败次数，key=regKey
 	dead       map[string]regEntry // 已被探活判定崩溃、待 Nacos 最终确认的源实例，key=regKey（期间禁止重建，保留实例本体以便自愈）
 	emptyStreak map[string]int     // 各 svc 源实例列表连续返回空的次数（容错：达 emptyStreakThreshold 才注销），key=svc
 	stopped    bool                // 方向已停止（准备/正在清理）：此后拒绝新的代注册，防清理后残留
