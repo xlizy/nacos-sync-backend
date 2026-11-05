@@ -54,7 +54,7 @@ export NACOS_SYNC_API_TOKEN=...    # 静态共享令牌（机器/脚本旁路鉴
 支持通过环境变量 `NACOS_SYNC_MODE` 选择运行模式：
 
 - `active`（默认）：启动 ConfigSync、NamingSync、watcher，并向 Nacos 注册工作节点。
-- `standby`：不启动任何同步引擎、不向 Nacos 注册工作节点；保留 HTTP 控制面与健康检查，写请求返回 HTTP 503，只允许查询及登录/登出。
+- `standby`：不启动任何同步引擎、不向 Nacos 注册工作节点；保留 HTTP 控制面与健康检查，写请求返回 HTTP 503，只允许查询及登录/登出。可通过 `GET /api/runtime-mode` 确认当前模式（返回 `mode`、`sync_enabled`、`read_only`）。
 
 推荐部署 1 主 1 备：A 使用默认 `active`，B 设置 `NACOS_SYNC_MODE=standby`。故障切换必须先确认 A 进程已停止或主机已隔离，再将 B 切换为 `active`（重启进程生效）。A 恢复后保持停止，直到确认 B 已停止并完成反向切换。不要仅凭健康检查失败自动提升备用节点；网络分区或进程暂停可能造成双主。
 
