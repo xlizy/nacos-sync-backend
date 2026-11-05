@@ -386,11 +386,14 @@ func (e *Engine) reconcile(cfg *config.Config) {
 	}
 	var toStop []stopItem
 	e.mu.Lock()
-	for id, cancel := range e.stops {
+	// Iterate the desired-direction snapshot, not only active cancel handles.
+	// startDirection can fail before goroutines are launched and remove its stop
+	// handle; such a direction must still disappear from Status when config removes it.
+	for id := range e.dirs {
 		if desiredSet[id] {
 			continue
 		}
-		toStop = append(toStop, stopItem{id: id, cancel: cancel, rd: e.runs[id]})
+		toStop = append(toStop, stopItem{id: id, cancel: e.stops[id], rd: e.runs[id]})
 		delete(e.stops, id)
 		delete(e.dirs, id)
 		delete(e.runs, id)
@@ -398,7 +401,9 @@ func (e *Engine) reconcile(cfg *config.Config) {
 	e.mu.Unlock()
 
 	for _, it := range toStop {
-		it.cancel()
+		if it.cancel != nil {
+			it.cancel()
+		}
 		// 单方向注销受 per-direction 超时约束，避免某方向实例极多时拖住整个 reconcile。
 		dctx, dcancel := context.WithTimeout(e.ctx, dirCleanupTimeout)
 		e.cleanupDirection(dctx, it.rd) // 注销目标上该方向的全部代注册实例
@@ -802,6 +807,9 @@ func (e *Engine) stopDir(id string) {
 		cancel()
 		delete(e.stops, id)
 	}
+	// startDirection invokes stopDir only before launching its goroutines.
+	// Drop the failed runtime record; dirs remains as the desired config snapshot.
+	delete(e.runs, id)
 	e.mu.Unlock()
 }
 
