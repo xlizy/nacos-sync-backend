@@ -1557,6 +1557,7 @@ func (e *Engine) fastPoll(ctx context.Context, rd *runningDir) {
 	if queryFailed && forceRepublish {
 		rd.republishAll.Store(true)
 	}
+	e.flushPendingDeregistrations(ctx, rd)
 	e.updateCounts(rd)
 }
 
@@ -1723,6 +1724,7 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 	if failed && forceRepublish {
 		rd.republishAll.Store(true)
 	}
+	e.flushPendingDeregistrations(ctx, rd)
 	e.updateCounts(rd)
 	if failed {
 		return // 保留本轮错误详情，不用 ok 覆盖
@@ -2041,9 +2043,7 @@ func (e *Engine) registerServiceProxied(ctx context.Context, rd *runningDir, svc
 func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance, force bool) bool {
 	key := regKey(svc, in)
 	if ctx.Err() != nil {
-		rd.mu.Lock()
-		rd.pendingDeregister[key] = pendingDeregister{entry: regEntry{svc: svc, inst: in}, force: force}
-		rd.mu.Unlock()
+		e.recordPendingDeregister(rd, key, svc, in, force)
 		return false
 	}
 	d := rd.direction()
@@ -2053,9 +2053,7 @@ func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc stri
 			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)), zap.Error(cerr))
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 		e.setErr(d.ID, cerr)
-		rd.mu.Lock()
-		rd.pendingDeregister[key] = pendingDeregister{entry: regEntry{svc: svc, inst: in}, force: force}
-		rd.mu.Unlock()
+		e.recordPendingDeregister(rd, key, svc, in, force)
 		return false
 	}
 	ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
@@ -2074,9 +2072,7 @@ func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc stri
 		e.logger.Error("deregister proxied failed",
 			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)), zap.Error(err))
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
-		rd.mu.Lock()
-		rd.pendingDeregister[key] = pendingDeregister{entry: regEntry{svc: svc, inst: in}, force: force}
-		rd.mu.Unlock()
+		e.recordPendingDeregister(rd, key, svc, in, force)
 		// 目标集群节点重启等连接层故障：重建本方向专属目标客户端（关闭旧连接、新建连接），下次写操作即自愈。
 		e.rebuildDstClient(rd)
 		return false
@@ -2088,6 +2084,15 @@ func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc stri
 		zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)))
 	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 	return true
+}
+
+func (e *Engine) recordPendingDeregister(rd *runningDir, key, svc string, in model.Instance, force bool) {
+	rd.mu.Lock()
+	if rd.pendingDeregister == nil {
+		rd.pendingDeregister = make(map[string]pendingDeregister)
+	}
+	rd.pendingDeregister[key] = pendingDeregister{entry: regEntry{svc: svc, inst: in}, force: force}
+	rd.mu.Unlock()
 }
 
 // flushPendingDeregistrations retries failed removals. For source-disappearance
