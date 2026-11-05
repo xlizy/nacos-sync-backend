@@ -365,10 +365,14 @@ type singleInstanceNamingClient struct {
 	naming_client.INamingClient
 	registered chan vo.RegisterInstanceParam
 	removed    chan vo.DeregisterInstanceParam
+	started    chan struct{}
+	release    chan struct{}
 }
 
 func (c singleInstanceNamingClient) RegisterInstance(p vo.RegisterInstanceParam) (bool, error) {
 	if c.registered != nil { c.registered <- p }
+	if c.started != nil { c.started <- struct{}{} }
+	if c.release != nil { <-c.release }
 	return true, nil
 }
 func (c singleInstanceNamingClient) DeregisterInstance(p vo.DeregisterInstanceParam) (bool, error) {
@@ -407,6 +411,51 @@ func TestDispatchOpsHandlesInstanceChangesIndependently(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("new instance was not independently registered")
+	}
+}
+
+func TestDispatchOpsUsesConfiguredPool(t *testing.T) {
+	pl, err := pool.New(2, zap.NewNop())
+	if err != nil { t.Fatal(err) }
+	defer pl.Release()
+	client := singleInstanceNamingClient{
+		started: make(chan struct{}, 3),
+		release: make(chan struct{}, 3),
+	}
+	e := &Engine{pl:pl, logger:zap.NewNop()}
+	rd := &runningDir{
+		d:&direction{ID:"g/s->g/d/",SrcCID:"s",DstCID:"d"}, dstClient:client,
+		registered:map[string]regEntry{}, failCount:map[string]int{}, dead:map[string]regEntry{},
+	}
+	ops := make([]regOp, 0, 3)
+	for i:=1;i<=3;i++ {
+		in:=model.Instance{Ip:fmt.Sprintf("10.0.0.%d",i),Port:8080}
+		rd.registered[regKey("SVC",in)] = regEntry{svc:"SVC",inst:in}
+		ops=append(ops,regOp{add:true,svc:"SVC",in:in})
+	}
+	done:=make(chan struct{})
+	go func(){ e.dispatchOps(context.Background(),rd,ops); close(done) }()
+	for i:=0;i<2;i++ {
+		select {
+		case <-client.started:
+		case <-time.After(time.Second): t.Fatal("pool did not start two concurrent registration tasks")
+		}
+	}
+	select {
+	case <-client.started:
+		t.Fatal("registration concurrency exceeded pool capacity")
+	default:
+	}
+	client.release <- struct{}{}
+	select {
+	case <-client.started:
+	case <-time.After(time.Second): t.Fatal("third task did not start after a pool worker was released")
+	}
+	client.release <- struct{}{}
+	client.release <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(time.Second): t.Fatal("dispatchOps did not wait for pool tasks")
 	}
 }
 
