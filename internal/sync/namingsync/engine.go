@@ -195,6 +195,7 @@ type runningDir struct {
 	dstClient    naming_client.INamingClient
 	workerClient naming_client.INamingClient // 独立于数据客户端的方向存活登记连接
 	workerDead   atomic.Bool // 任一方向协程异常退出；reconcile 据此重启整个方向
+	republishAll atomic.Bool // 目标写连接重建后，本方向全部服务都需要重新发布
 }
 
 // isStopped 报告该方向是否已被停止（准备/正在清理）。
@@ -1866,8 +1867,29 @@ func (e *Engine) dstClient(rd *runningDir) (naming_client.INamingClient, error) 
 	rd.clientMu.Lock()
 	c := rd.dstClient
 	rd.clientMu.Unlock()
-	if c == nil {
-		return nil, fmt.Errorf("direction %s has no destination client (not started?)", rd.direction().ID)
+	if c != nil {
+		return c, nil
+	}
+
+	// A previous rebuild may have failed after closing the old client. Do not
+	// leave the direction permanently wedged on a nil pointer: retry creation
+	// on the next write attempt and mark the whole direction dirty.
+	d := rd.direction()
+	nc, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("rebuild destination client for direction %s: %w", d.ID, err)
+	}
+	rd.clientMu.Lock()
+	if rd.dstClient == nil {
+		rd.dstClient = nc
+		c = nc
+		rd.republishAll.Store(true)
+	} else {
+		c = rd.dstClient
+	}
+	rd.clientMu.Unlock()
+	if c != nc {
+		e.mgr.CloseDedicatedNamingClient(nc)
 	}
 	return c, nil
 }
@@ -1875,22 +1897,30 @@ func (e *Engine) dstClient(rd *runningDir) (naming_client.INamingClient, error) 
 // rebuildDstClient 本方向写操作遭遇连接层故障时，重建本方向专属目标客户端（关闭旧连接、新建连接）。
 // 仅影响本方向：旧客户端被关闭即销毁其 registeredInstanceCached，新客户端独立，不会误伤其它方向的目标连接。
 func (e *Engine) rebuildDstClient(rd *runningDir) {
-	// 整个生命周期持锁：任何新建客户端要么安装为当前客户端，要么明确关闭，
-	// 不允许并发重建覆盖指针后留下仍会 redoRegister 的失控连接。
+	// Callers hold rd.opMu, so no direction write can race this replacement.
 	rd.clientMu.Lock()
-	defer rd.clientMu.Unlock()
 	old := rd.dstClient
 	rd.dstClient = nil
+	rd.clientMu.Unlock()
 	if old != nil {
 		e.mgr.CloseDedicatedNamingClient(old)
 	}
+
 	d := rd.direction()
 	nc, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
 	if err != nil {
 		e.logger.Error("rebuild direction dst client failed", zap.String("dir", d.ID), zap.Error(err))
+		// Keep republishAll set. dstClient() will retry construction on the next
+		// operation, and the successful retry will republish every service.
+		rd.republishAll.Store(true)
 		return
 	}
+	rd.clientMu.Lock()
 	rd.dstClient = nc
+	rd.clientMu.Unlock()
+	// Closing the old connection removes every ephemeral publication owned by
+	// it, not merely the instance whose write failed.
+	rd.republishAll.Store(true)
 }
 
 // registerProxied 向目标集群发起代注册（临时实例 ephemeral=true，走 gRPC，Nacos 3.x 支持）。
