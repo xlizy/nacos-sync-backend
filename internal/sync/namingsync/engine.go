@@ -27,6 +27,7 @@ package namingsync
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
@@ -212,12 +213,13 @@ func (rd *runningDir) setDirection(d *direction) {
 	rd.mu.Unlock()
 }
 
-// regKey 用「服务名 + 实例键」唯一标识一个被跟踪的源实例，因为一个方向可能跨多个服务。
+// regKey 用「服务名 + 实例规格键」唯一标识一个被跟踪的源发布。
+// 同一 endpoint 可能由多个 Nacos Client 发布不同 metadata/weight；这些是服务端聚合视图中的不同记录。
 func regKey(svc string, in model.Instance) string {
-	return svc + "\x00" + instKey(in)
+	return svc + "\x00" + instanceSpecKey(in)
 }
 
-// splitRegKey 从 regKey（svc\x00instKey）拆出 svc 段与 instKey 段。
+// splitRegKey 从 regKey（svc\x00instanceSpecKey）拆出 svc 段与实例规格键。
 func splitRegKey(rk string) (svc, ik string) {
 	if i := strings.IndexByte(rk, 0); i >= 0 {
 		return rk[:i], rk[i+1:]
@@ -1542,7 +1544,7 @@ func (e *Engine) fastPoll(ctx context.Context, rd *runningDir) {
 			if re.svc != svc {
 				continue
 			}
-			if _, ok := natives[instKey(re.inst)]; ok {
+			if _, ok := natives[instanceSpecKey(re.inst)]; ok {
 				continue
 			}
 			delete(rd.registered, rk)
@@ -1687,7 +1689,7 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 		ours := make(map[string]model.Instance, len(dstAll))
 		for _, in := range dstAll {
 			if isOurs(in, d.SrcCID, d.ID) {
-				ours[instKey(in)] = in
+				ours[instanceSpecKey(sourceViewOfProxy(in))] = in
 			}
 		}
 
@@ -1709,7 +1711,7 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 					ops = append(ops, regOp{add: true, svc: svc, in: in})
 					continue
 				}
-				dst, exists := ours[instKey(in)]
+				dst, exists := ours[instanceSpecKey(in)]
 				if !exists || e.instanceNeedsUpdate(d, in, dst) {
 					ops = append(ops, regOp{add: true, svc: svc, in: in})
 				}
@@ -1720,7 +1722,7 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 			if _, ok := natives[key]; ok {
 				continue
 			}
-			rk := regKey(svc, in)
+			rk := svc + "\x00" + key
 			delete(rd.registered, rk)
 			delete(rd.failCount, rk)
 			delete(rd.dead, rk)
@@ -1840,7 +1842,7 @@ func filterNatives(srcList []model.Instance) map[string]model.Instance {
 		if isProxied(in) {
 			continue
 		}
-		natives[instKey(in)] = in
+		natives[instanceSpecKey(in)] = in
 	}
 	return natives
 }
@@ -2145,6 +2147,47 @@ func isOurs(in model.Instance, srcCID, directionID string) bool {
 		return false
 	}
 	return true
+}
+
+// instanceSpecKey distinguishes publisher records that share an endpoint but
+// differ in metadata or operational attributes. Nacos aggregates publisher
+// clients independently; its service view can therefore contain both records.
+func instanceSpecKey(in model.Instance) string {
+	metadata := in.Metadata
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	spec := struct {
+		IP          string            `json:"ip"`
+		Port        uint64            `json:"port"`
+		ClusterName string            `json:"clusterName"`
+		Weight      float64           `json:"weight"`
+		Enable      bool              `json:"enable"`
+		Healthy     bool              `json:"healthy"`
+		Metadata    map[string]string `json:"metadata"`
+	}{
+		IP: in.Ip, Port: in.Port, ClusterName: in.ClusterName,
+		Weight: in.Weight, Enable: in.Enable, Healthy: in.Healthy, Metadata: metadata,
+	}
+	encoded, _ := json.Marshal(spec) // string-keyed metadata is always JSON encodable
+	return string(encoded)
+}
+
+// sourceViewOfProxy removes the ownership metadata added by proxiedMetadata so
+// a target publisher can be matched to its corresponding source specification.
+func sourceViewOfProxy(in model.Instance) model.Instance {
+	out := in
+	metadata := make(map[string]string, len(in.Metadata))
+	for key, value := range in.Metadata {
+		switch key {
+		case metaSyncSource, metaSyncSourceCluster, metaSyncSourceDirection:
+			continue
+		default:
+			metadata[key] = value
+		}
+	}
+	out.Metadata = metadata
+	return out
 }
 
 func instKey(in model.Instance) string {
