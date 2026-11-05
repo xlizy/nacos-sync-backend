@@ -1824,7 +1824,28 @@ func (e *Engine) ensureWorker(rd *runningDir) (bool, error) {
 		return false, fmt.Errorf("direction %s has no Worker heartbeat client", d.ID)
 	}
 	if err := e.worker.Ensure(cli, d.DstCID, d.Namespace, d.ID); err != nil {
-		return false, err
+		if !nacos.IsConnectionError(err) {
+			return false, err
+		}
+
+		// The Worker connection is independent from the data-plane connection.
+		// If it becomes UNHEALTHY, retrying Ensure on the same SDK client can
+		// never restore the heartbeat. Replace only this direction's Worker
+		// client; do not touch dstClient or its registered business instances.
+		replacement, buildErr := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
+		if buildErr != nil {
+			return false, fmt.Errorf("rebuild worker heartbeat client: %w (previous error: %v)", buildErr, err)
+		}
+		rd.clientMu.Lock()
+		oldClient := rd.workerClient
+		rd.workerClient = replacement
+		rd.clientMu.Unlock()
+		if oldClient != nil {
+			e.mgr.CloseDedicatedNamingClient(oldClient)
+		}
+		if retryErr := e.worker.Ensure(replacement, d.DstCID, d.Namespace, d.ID); retryErr != nil {
+			return false, fmt.Errorf("re-register Worker heartbeat after reconnect: %w", retryErr)
+		}
 	}
 	return true, nil
 }
