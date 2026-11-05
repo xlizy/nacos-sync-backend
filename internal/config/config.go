@@ -476,7 +476,7 @@ func genGroupID(existing []NacosGroup) string {
 	return randID(8) // 极端碰撞兜底
 }
 
-// genClusterID 生成不重复的 4 位集群 ID。
+// genClusterID 生成不重复的 4 位集群 ID（仅供同组旧逻辑使用）。
 func genClusterID(existing []NacosCluster) string {
 	used := clusterIDSet(existing)
 	for i := 0; i < 100; i++ {
@@ -486,6 +486,65 @@ func genClusterID(existing []NacosCluster) string {
 		}
 	}
 	return randID(8)
+}
+
+// validateUniqueClusterIDs 保证 c_id 在所有 nacos-group 中全局唯一。
+// ClientManager 的客户端缓存与连接解析均以 c_id 为唯一键，不能只保证组内唯一。
+func validateUniqueClusterIDs(groups []NacosGroup) error {
+	owners := make(map[string]string)
+	for _, g := range groups {
+		for _, cl := range g.Clusters {
+			if cl.CID == "" {
+				continue
+			}
+			if owner, ok := owners[cl.CID]; ok {
+					return fmt.Errorf("duplicate c_id %q across nacos-group %q and %q; c_id must be globally unique", cl.CID, owner, g.GrpID)
+				}
+			owners[cl.CID] = g.GrpID
+		}
+	}
+	return nil
+}
+
+// ensureClusterIDsGlobal 为待写入分组补 ID，生成时避开其它所有分组的 c_id。
+func ensureClusterIDsGlobal(clusters []NacosCluster, groups []NacosGroup, replacingGrpID string) []NacosCluster {
+	used := make(map[string]bool)
+	for _, g := range groups {
+		if g.GrpID == replacingGrpID {
+			continue
+		}
+		for _, cl := range g.Clusters {
+			if cl.CID != "" {
+				used[cl.CID] = true
+			}
+		}
+	}
+	for _, cl := range clusters {
+		if cl.CID != "" {
+			used[cl.CID] = true
+		}
+	}
+	for i := range clusters {
+		if clusters[i].CID == "" {
+			id := genClusterIDAvoiding(used)
+			clusters[i].CID = id
+			used[id] = true
+		}
+	}
+	return clusters
+}
+
+// genClusterIDGlobal 生成一个未被任何分组使用的集群 ID。
+func genClusterIDGlobal(groups []NacosGroup) string {
+	used := make(map[string]bool)
+	for _, g := range groups {
+		for _, cl := range g.Clusters {
+			if cl.CID != "" {
+				used[cl.CID] = true
+			}
+		}
+	}
+	return genClusterIDAvoiding(used)
 }
 
 // ensureClusterIDs 为 c_id 为空的集群生成不重复 ID（同一次调用内也避免碰撞）。
@@ -791,8 +850,7 @@ func (m *Manager) UpsertGroup(g NacosGroup) (*NacosGroup, error) {
 	if len(g.GrpName) > 16 {
 		return nil, fmt.Errorf("grp_name too long: max 16 chars, got %d", len(g.GrpName))
 	}
-	// 内嵌集群若未带 c_id，自动生成（与独立 cluster 端点保持一致）；同时校验节点格式。
-	g.Clusters = ensureClusterIDs(g.Clusters)
+	// 节点格式校验；c_id 在持写锁后结合全局配置生成与校验。
 	if len(g.Clusters) > 0 {
 		for i := range g.Clusters {
 			cleaned, verr := validateNodes(g.Clusters[i].CNodes)
@@ -816,6 +874,7 @@ func (m *Manager) UpsertGroup(g NacosGroup) (*NacosGroup, error) {
 	if g.GrpID == "" {
 		g.GrpID = genGroupID(nc.NacosGroup)
 	}
+	g.Clusters = ensureClusterIDsGlobal(g.Clusters, nc.NacosGroup, g.GrpID)
 	// 新建分组时，在 config-sync 段默认登记一条「不同步」（false）。
 	if idx < 0 {
 		if nc.ConfigSync == nil {
@@ -845,6 +904,9 @@ func (m *Manager) UpsertGroup(g NacosGroup) (*NacosGroup, error) {
 		nc.NacosGroup[idx] = g
 	} else {
 		nc.NacosGroup = append(nc.NacosGroup, g)
+	}
+	if err := validateUniqueClusterIDs(nc.NacosGroup); err != nil {
+		return nil, err
 	}
 	if err := m.Publish(nc); err != nil {
 		return nil, err
@@ -940,7 +1002,7 @@ func (m *Manager) UpsertCluster(grpID string, cl NacosCluster) (*NacosCluster, e
 		}
 	}
 	if cl.CID == "" {
-		cl.CID = genClusterID(g.Clusters)
+		cl.CID = genClusterIDGlobal(nc.NacosGroup)
 	}
 	if ci >= 0 {
 		g.Clusters[ci] = cl
@@ -948,6 +1010,9 @@ func (m *Manager) UpsertCluster(grpID string, cl NacosCluster) (*NacosCluster, e
 		g.Clusters = append(g.Clusters, cl)
 	}
 	nc.NacosGroup[gi] = g
+	if err := validateUniqueClusterIDs(nc.NacosGroup); err != nil {
+		return nil, err
+	}
 	if err := m.Publish(nc); err != nil {
 		return nil, err
 	}
@@ -1012,12 +1077,14 @@ func (c *Config) configSyncAnyEnabled() bool {
 // 老集群（2.x）不参与 config 同步，仅新集群（3.x）之间互相同步。
 func (c *Config) newClusterIDs() []string {
 	var ids []string
+	seen := make(map[string]bool)
 	for _, g := range c.NacosGroup {
 		if g.GrpVersion != "3X" {
 			continue
 		}
 		for _, cl := range g.Clusters {
-			if cl.CID != "" {
+			if cl.CID != "" && !seen[cl.CID] {
+				seen[cl.CID] = true
 				ids = append(ids, cl.CID)
 			}
 		}
