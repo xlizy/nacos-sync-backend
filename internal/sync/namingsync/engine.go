@@ -903,19 +903,7 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 		e.logger.Info("cleanup deregister proxied ok", zap.String("dir", d.ID), zap.String("svc", re.svc), zap.String("inst", instKey(re.inst)))
 	}
 
-	// 数据面清理完成后才撤销 Worker 心跳，避免清理期间被其他节点判为孤儿。
-	rd.clientMu.Lock()
-	workerClient := rd.workerClient
-	rd.workerClient = nil
-	rd.clientMu.Unlock()
-	if e.worker != nil && workerClient != nil {
-		if err := e.worker.Leave(workerClient, d.ID); err != nil {
-			e.logger.Warn("leave naming worker heartbeat failed", zap.String("dir", d.ID), zap.Error(err))
-		}
-	}
-	if workerClient != nil {
-		e.mgr.CloseDedicatedNamingClient(workerClient)
-	}
+	
 }
 
 // sweepTarget 孤儿清扫目标：目标集群 + 命名空间 + 服务。
