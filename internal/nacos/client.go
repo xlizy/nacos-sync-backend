@@ -114,10 +114,13 @@ func NewClientManager(conf *config.Manager) *ClientManager {
 	return m
 }
 
-// connFor 按全局唯一的 c_id 查找集群连接信息。若存量配置存在重复 ID，明确失败，
-// 绝不静默选择第一个分组，避免客户端缓存串到错误的 Nacos 集群。
+// connFor 按全局唯一的 c_id 查找集群连接信息。
 func (m *ClientManager) connFor(cid string) (clusterConn, error) {
-	cfg := m.conf.Get()
+	return resolveClusterConn(m.conf.Get(), cid)
+}
+
+// resolveClusterConn 将 c_id 解析为连接信息。重复 ID 明确失败，避免静默连接到错误集群。
+func resolveClusterConn(cfg *config.Config, cid string) (clusterConn, error) {
 	var found *clusterConn
 	var foundGroup string
 	for _, g := range cfg.NacosGroup {
