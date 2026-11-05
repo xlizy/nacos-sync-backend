@@ -2,6 +2,7 @@ package configsync
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -15,15 +16,16 @@ import (
 type forwardConfigClient struct {
 	config_client.IConfigClient
 	mu       sync.Mutex
-	content  string
+	content   string
+	getErr    error
 	published []string
-	deleted  int
+	deleted   int
 }
 
 func (c *forwardConfigClient) GetConfig(vo.ConfigParam) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.content, nil
+	return c.content, c.getErr
 }
 
 func (c *forwardConfigClient) PublishConfig(p vo.ConfigParam) (bool, error) {
@@ -83,3 +85,22 @@ func TestForwardPublishesWhenTargetContentAlreadyMatches(t *testing.T) {
 	}
 }
 
+
+func TestForwardDoesNotPublishStalePayloadWhenSourceReadFails(t *testing.T) {
+	src := &forwardConfigClient{content: "current-but-unverified", getErr: errors.New("source unavailable")}
+	tgt := &forwardConfigClient{content: "old-target-value"}
+	e := &Engine{logger: zap.NewNop()}
+
+	err := e.forward(
+		context.Background(),
+		config.SyncLink{From: "source", To: "target", Kind: "config"},
+		"namespace", "DEFAULT_GROUP", "application.yaml",
+		"stale-listener-payload", src, tgt,
+	)
+	if err == nil {
+		t.Fatal("expected source read failure")
+	}
+	if len(tgt.published) != 0 || tgt.deleted != 0 {
+		t.Fatalf("published/deleted despite source read failure: published=%v deleted=%d", tgt.published, tgt.deleted)
+	}
+}
