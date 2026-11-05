@@ -210,7 +210,8 @@ func TestFilterNativesPreservesSameEndpointPublisherVariants(t *testing.T) {
 		"version": "v2", "zone": "b",
 		metaSyncSource: "NACOS",
 		metaSyncSourceCluster: "src",
-			}
+		"syncSourceDirection": "legacy-direction",
+	}
 	if got := instanceSpecKey(sourceViewOfProxy(proxy)); got != instanceSpecKey(second) {
 		t.Fatal("proxy ownership metadata must be stripped when matching a target publisher to its source spec")
 	}
