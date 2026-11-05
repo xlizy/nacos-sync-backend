@@ -541,6 +541,68 @@ func TestRegisterProxiedRegistersOneInstance(t *testing.T) {
 	if got:=len(client.registered);got!=0 { t.Fatalf("one operation registered extra instances: %d",got) }
 }
 
+func TestDeregisterProxiedRepublishesRemainingInstances(t *testing.T) {
+	client := singleInstanceNamingClient{
+		registered: make(chan vo.RegisterInstanceParam, 1),
+		removed:    make(chan vo.DeregisterInstanceParam, 1),
+	}
+	removed := model.Instance{Ip: "10.0.0.1", Port: 8080, ClusterName: "DEFAULT"}
+	remaining := model.Instance{Ip: "10.0.0.2", Port: 8080, ClusterName: "DEFAULT", Metadata: map[string]string{"version": "v2"}}
+	rd := &runningDir{
+		d: &direction{ID: "g/s->g/d/", SrcCID: "src", DstCID: "dst"},
+		dstClient: client,
+		registered: map[string]regEntry{
+			regKey("SVC", remaining): {svc: "SVC", inst: remaining},
+		},
+		failCount: map[string]int{},
+	}
+	e := &Engine{logger: zap.NewNop(), lastErr: map[string]string{}}
+
+	e.deregisterProxied(context.Background(), rd, "SVC", removed)
+	select {
+	case got := <-client.removed:
+		if got.Ip != removed.Ip {
+			t.Fatalf("deregistered %s, want %s", got.Ip, removed.Ip)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DeregisterInstance was not called")
+	}
+	select {
+	case got := <-client.registered:
+		if got.Ip != remaining.Ip || got.Metadata["version"] != "v2" {
+			t.Fatalf("remaining instance was not republished: %+v", got)
+		}
+		if got.Metadata[metaSyncSource] != "NACOS" || got.Metadata[metaSyncSourceCluster] != "src" {
+			t.Fatalf("republished instance is missing ownership metadata: %+v", got.Metadata)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remaining instance was not republished after deregistration")
+	}
+}
+
+func TestRegisterProxiedRejectsMetadataOver1024Bytes(t *testing.T) {
+	client := singleInstanceNamingClient{registered: make(chan vo.RegisterInstanceParam, 1)}
+	in := model.Instance{
+		Ip: "10.0.0.1", Port: 8080,
+		Metadata: map[string]string{"payload": fmt.Sprintf("%01050d", 0)},
+	}
+	rd := &runningDir{
+		d: &direction{ID: "g/s->g/d/", SrcCID: "src", DstCID: "dst"},
+		dstClient: client, failCount: map[string]int{},
+	}
+	e := &Engine{logger: zap.NewNop(), lastErr: map[string]string{}}
+	e.registerProxied(context.Background(), rd, "SVC", in)
+	if got := len(client.registered); got != 0 {
+		t.Fatalf("oversized metadata reached Nacos: %d registration calls", got)
+	}
+	if e.lastErr[rd.d.ID] == "" {
+		t.Fatal("oversized metadata must be reported in direction status")
+	}
+	if !rd.writeFailed.Load() {
+		t.Fatal("oversized metadata must mark the direction write as failed")
+	}
+}
+
 func TestCleanupDirectionClosesSingleDirectionClient(t *testing.T) {
 	client := singleInstanceNamingClient{}
 	e := &Engine{logger: zap.NewNop()}
