@@ -3,6 +3,7 @@ package namingsync
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,13 +43,7 @@ func TestIsOurs(t *testing.T) {
 	if isOurs(other, "abc1", "dirA") {
 		t.Fatal("其它方向的代注册实例不应被本方向清理")
 	}
-	collision := model.Instance{Metadata: map[string]string{
-		metaSyncSource: "NACOS", metaSyncSourceCluster: "abc1", metaSyncSourceDirection: "dirB",
-	}}
-	if isOurs(collision, "abc1", "dirA") {
-		t.Fatal("相同 srcCID 但方向 ID 不同的实例不能被当前方向认领")
-	}
-	legacy := model.Instance{Metadata: map[string]string{
+		legacy := model.Instance{Metadata: map[string]string{
 		metaSyncSource: "NACOS", metaSyncSourceCluster: "abc1",
 	}}
 	if !isOurs(legacy, "abc1", "dirA") {
@@ -216,7 +211,7 @@ func TestFilterNativesPreservesSameEndpointPublisherVariants(t *testing.T) {
 		"version": "v2", "zone": "b",
 		metaSyncSource: "NACOS",
 		metaSyncSourceCluster: "src",
-		metaSyncSourceDirection: "g/src->g/dst/",
+		"syncSourceDirection": "legacy-direction",
 	}
 	if got := instanceSpecKey(sourceViewOfProxy(proxy)); got != instanceSpecKey(second) {
 		t.Fatal("proxy ownership metadata must be stripped when matching a target publisher to its source spec")
@@ -226,6 +221,23 @@ func TestFilterNativesPreservesSameEndpointPublisherVariants(t *testing.T) {
 // TestGroupCrossDirections 锁定组外同步拓扑：A、B 两组「全互联」——
 // 每组每个集群 ↔ 对方组每个集群（双向），方向数 = |A集群| × |B集群| × 2。
 // 历史回归点：早期版本只挑各组「主集群」，导致服务注册在非主集群时完全同步不出去。
+func TestValidateUniquePublishers(t *testing.T) {
+	base := model.Instance{Ip: "10.0.0.8", Port: 8080, ClusterName: "DEFAULT", Weight: 1, Enable: true, Healthy: true}
+	first := base
+	first.Metadata = map[string]string{"version": "v1"}
+	second := base
+	second.Metadata = map[string]string{"version": "v2"}
+	conflict := map[string]model.Instance{instanceSpecKey(first): first, instanceSpecKey(second): second}
+	if err := validateUniquePublishers(conflict); err == nil {
+		t.Fatal("one direction client must reject distinct publisher records sharing one endpoint")
+	}
+	second.Ip = "10.0.0.9"
+	independent := map[string]model.Instance{instanceSpecKey(first): first, instanceSpecKey(second): second}
+	if err := validateUniquePublishers(independent); err != nil {
+		t.Fatalf("different endpoints should be representable: %v", err)
+	}
+}
+
 func TestGroupCrossDirections(t *testing.T) {
 	ga := config.NacosGroup{Clusters: []config.NacosCluster{{CID: "a1"}, {CID: "a2"}}}
 	gb := config.NacosGroup{Clusters: []config.NacosCluster{{CID: "b1"}}}
@@ -414,49 +426,33 @@ func TestDispatchOpsHandlesInstanceChangesIndependently(t *testing.T) {
 	}
 }
 
-func TestDispatchOpsUsesConfiguredPool(t *testing.T) {
+func TestDispatchOpsUsesConfiguredPoolAcrossServices(t *testing.T) {
 	pl, err := pool.New(2, zap.NewNop())
 	if err != nil { t.Fatal(err) }
 	defer pl.Release()
-	client := singleInstanceNamingClient{
-		started: make(chan struct{}, 3),
-		release: make(chan struct{}, 3),
-	}
-	e := &Engine{pl:pl, logger:zap.NewNop()}
-	rd := &runningDir{
-		d:&direction{ID:"g/s->g/d/",SrcCID:"s",DstCID:"d"}, dstClient:client,
-		registered:map[string]regEntry{}, failCount:map[string]int{}, dead:map[string]regEntry{},
-	}
-	ops := make([]regOp, 0, 3)
-	for i:=1;i<=3;i++ {
-		in:=model.Instance{Ip:fmt.Sprintf("10.0.0.%d",i),Port:8080}
-		rd.registered[regKey("SVC",in)] = regEntry{svc:"SVC",inst:in}
-		ops=append(ops,regOp{add:true,svc:"SVC",in:in})
-	}
-	done:=make(chan struct{})
-	go func(){ e.dispatchOps(context.Background(),rd,ops); close(done) }()
-	for i:=0;i<2;i++ {
-		select {
-		case <-client.started:
-		case <-time.After(time.Second): t.Fatal("pool did not start two concurrent registration tasks")
-		}
-	}
-	select {
-	case <-client.started:
-		t.Fatal("registration concurrency exceeded pool capacity")
-	default:
-	}
-	client.release <- struct{}{}
-	select {
-	case <-client.started:
-	case <-time.After(time.Second): t.Fatal("third task did not start after a pool worker was released")
-	}
-	client.release <- struct{}{}
-	client.release <- struct{}{}
-	select {
-	case <-done:
-	case <-time.After(time.Second): t.Fatal("dispatchOps did not wait for pool tasks")
-	}
+	client := singleInstanceNamingClient{started: make(chan struct{}, 3), release: make(chan struct{}, 3)}
+	e := &Engine{pl: pl, logger: zap.NewNop()}
+	rd := &runningDir{d: &direction{ID:"g/s->g/d/",SrcCID:"s",DstCID:"d"},dstClient:client,registered:map[string]regEntry{},failCount:map[string]int{},dead:map[string]regEntry{}}
+	ops := make([]regOp,0,3)
+	for i:=1;i<=3;i++ { svc:=fmt.Sprintf("SVC-%d",i);in:=model.Instance{Ip:fmt.Sprintf("10.0.0.%d",i),Port:8080};rd.registered[regKey(svc,in)]=regEntry{svc:svc,inst:in};ops=append(ops,regOp{add:true,svc:svc,in:in}) }
+	done:=make(chan struct{});go func(){e.dispatchOps(context.Background(),rd,ops);close(done)}()
+	for i:=0;i<2;i++ { select {case <-client.started: case <-time.After(time.Second):t.Fatal("pool did not run independent services concurrently")} }
+	select {case <-client.started:t.Fatal("registration concurrency exceeded pool capacity");default:}
+	client.release<-struct{}{}
+	select {case <-client.started:case <-time.After(time.Second):t.Fatal("third service did not start after a pool worker was released")}
+	client.release<-struct{}{};client.release<-struct{}{}
+	select {case <-done:case <-time.After(time.Second):t.Fatal("dispatchOps did not wait for pool tasks")}
+}
+
+func TestDispatchOpsSerializesSameService(t *testing.T) {
+	client:=singleInstanceNamingClient{started:make(chan struct{},3),release:make(chan struct{},3)}
+	e:=&Engine{logger:zap.NewNop()}
+	rd:=&runningDir{d:&direction{ID:"g/s->g/d/",SrcCID:"s",DstCID:"d"},dstClient:client,registered:map[string]regEntry{},failCount:map[string]int{},dead:map[string]regEntry{}}
+	ops:=make([]regOp,0,3)
+	for i:=1;i<=3;i++ { in:=model.Instance{Ip:fmt.Sprintf("10.0.0.%d",i),Port:8080};rd.registered[regKey("SVC",in)]=regEntry{svc:"SVC",inst:in};ops=append(ops,regOp{add:true,svc:"SVC",in:in}) }
+	done:=make(chan struct{});go func(){e.dispatchOps(context.Background(),rd,ops);close(done)}()
+	for i:=0;i<3;i++ { select {case <-client.started:case <-time.After(time.Second):t.Fatalf("same-service task %d did not start",i+1)};select{case <-client.started:t.Fatal("same-service operations ran concurrently");default:};client.release<-struct{}{} }
+	select {case <-done:case <-time.After(time.Second):t.Fatal("dispatchOps did not wait for same-service operations")}
 }
 
 func TestDispatchOpsDoesNotCollapseSameServiceRemovals(t *testing.T) {
@@ -551,8 +547,11 @@ func TestRegisterProxiedRegistersOneInstance(t *testing.T) {
 		if got.ServiceName!="TEST-SVC" || got.Ip!=first.Ip || got.Metadata["k"]!="v" {
 			t.Fatalf("unexpected RegisterInstance params: %+v",got)
 		}
-		if got.Metadata[metaSyncSource]!="NACOS" || got.Metadata[metaSyncSourceCluster]!="s" {
-			t.Fatalf("missing ownership metadata: %+v",got.Metadata)
+		if got.Metadata[metaSyncSource] != "NACOS" || got.Metadata[metaSyncSourceCluster] != "s" {
+			t.Fatalf("missing ownership metadata: %+v", got.Metadata)
+		}
+		if len(got.Metadata) != 3 {
+			t.Fatalf("expected source metadata plus exactly two ownership fields, got %+v", got.Metadata)
 		}
 		if _,ok:=got.Metadata["syncSourceAgent"];ok { t.Fatalf("node-specific metadata leaked: %+v",got.Metadata) }
 	case <-time.After(time.Second):
@@ -561,22 +560,92 @@ func TestRegisterProxiedRegistersOneInstance(t *testing.T) {
 	if got:=len(client.registered);got!=0 { t.Fatalf("one operation registered extra instances: %d",got) }
 }
 
-func TestCleanupDirectionClearsPerInstancePublishers(t *testing.T) {
-	e:=&Engine{logger:zap.NewNop()}
-	rd:=&runningDir{
-		d:&direction{ID:"src->dst",SrcCID:"src",DstCID:"dst"},
-		instanceClients:map[string]naming_client.INamingClient{},
-		registered:map[string]regEntry{},dead:map[string]regEntry{},failCount:map[string]int{},
+func TestDeregisterProxiedRepublishesRemainingInstances(t *testing.T) {
+	client := singleInstanceNamingClient{
+		registered: make(chan vo.RegisterInstanceParam, 1),
+		removed:    make(chan vo.DeregisterInstanceParam, 1),
 	}
-	for i:=0;i<5;i++ {
-		in:=model.Instance{Ip:fmt.Sprintf("10.0.0.%d",i+1),Port:uint64(1000+i)}
-		rd.instanceClients[regKey("svc",in)]=singleInstanceNamingClient{}
-		rd.registered[regKey("svc",in)]=regEntry{svc:"svc",inst:in}
+	removed := model.Instance{Ip: "10.0.0.1", Port: 8080, ClusterName: "DEFAULT"}
+	remaining := model.Instance{Ip: "10.0.0.2", Port: 8080, ClusterName: "DEFAULT", Metadata: map[string]string{"version": "v2"}}
+	rd := &runningDir{
+		d: &direction{ID: "g/s->g/d/", SrcCID: "src", DstCID: "dst"},
+		dstClient: client,
+		registered: map[string]regEntry{
+			regKey("SVC", remaining): {svc: "SVC", inst: remaining},
+		},
+		failCount: map[string]int{},
 	}
-	ctx,cancel:=context.WithTimeout(context.Background(),time.Second)
+	e := &Engine{logger: zap.NewNop(), lastErr: map[string]string{}}
+
+	e.deregisterProxied(context.Background(), rd, "SVC", removed)
+	select {
+	case got := <-client.removed:
+		if got.Ip != removed.Ip {
+			t.Fatalf("deregistered %s, want %s", got.Ip, removed.Ip)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DeregisterInstance was not called")
+	}
+	select {
+	case got := <-client.registered:
+		if got.Ip != remaining.Ip || got.Metadata["version"] != "v2" {
+			t.Fatalf("remaining instance was not republished: %+v", got)
+		}
+		if got.Metadata[metaSyncSource] != "NACOS" || got.Metadata[metaSyncSourceCluster] != "src" {
+			t.Fatalf("republished instance is missing ownership metadata: %+v", got.Metadata)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remaining instance was not republished after deregistration")
+	}
+}
+
+func TestNacosMetadataLengthCountsCharacters(t *testing.T) {
+	if got := nacosMetadataLength(map[string]string{"键": "中😀"}); got != 4 {
+		t.Fatalf("UTF-16 metadata length = %d, want 4", got)
+	}
+	if got := nacosMetadataLength(map[string]string{"k": strings.Repeat("中", 1023)}); got != 1024 {
+		t.Fatalf("metadata length = %d, want 1024", got)
+	}
+}
+
+func TestRegisterProxiedRejectsMetadataOver1024Characters(t *testing.T) {
+	client := singleInstanceNamingClient{registered: make(chan vo.RegisterInstanceParam, 1)}
+	in := model.Instance{
+		Ip: "10.0.0.1", Port: 8080,
+		Metadata: map[string]string{"payload": strings.Repeat("x", 1024)},
+	}
+	rd := &runningDir{
+		d: &direction{ID: "g/s->g/d/", SrcCID: "src", DstCID: "dst"},
+		dstClient: client, failCount: map[string]int{},
+	}
+	e := &Engine{logger: zap.NewNop(), lastErr: map[string]string{}}
+	e.registerProxied(context.Background(), rd, "SVC", in)
+	if got := len(client.registered); got != 0 {
+		t.Fatalf("oversized metadata reached Nacos: %d registration calls", got)
+	}
+	if e.lastErr[rd.d.ID] == "" {
+		t.Fatal("oversized metadata must be reported in direction status")
+	}
+	if !rd.writeFailed.Load() {
+		t.Fatal("oversized metadata must mark the direction write as failed")
+	}
+}
+
+func TestCleanupDirectionClosesSingleDirectionClient(t *testing.T) {
+	client := singleInstanceNamingClient{}
+	e := &Engine{logger: zap.NewNop()}
+	rd := &runningDir{
+		d: &direction{ID: "src->dst", SrcCID: "src", DstCID: "dst"},
+		dstClient: client, registered: map[string]regEntry{}, dead: map[string]regEntry{}, failCount: map[string]int{},
+	}
+	for i := 0; i < 5; i++ {
+		in := model.Instance{Ip: fmt.Sprintf("10.0.0.%d", i+1), Port: uint64(1000+i)}
+		rd.registered[regKey("svc", in)] = regEntry{svc: "svc", inst: in}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	e.cleanupDirection(ctx,rd)
+	e.cleanupDirection(ctx, rd)
 	if !rd.isStopped() { t.Fatal("cleanup must mark direction stopped") }
-	if len(rd.instanceClients)!=0 { t.Fatalf("cleanup left %d instance clients",len(rd.instanceClients)) }
-	if len(rd.registered)!=0 { t.Fatalf("cleanup left %d registered records",len(rd.registered)) }
+	if rd.dstClient != nil { t.Fatal("cleanup must release the single direction client") }
+	if len(rd.registered) != 0 { t.Fatalf("cleanup left %d registered records", len(rd.registered)) }
 }
