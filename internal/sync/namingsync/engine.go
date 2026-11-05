@@ -1406,8 +1406,16 @@ func (e *Engine) reconcileDisappearedDubboServices(ctx context.Context, rd *runn
 		}
 	}
 	rd.mu.Unlock()
+	// A service has one publisher per connection. Collapse multiple removed
+	// instances from the same service into one deregistration request.
+	removedByService := make(map[string]model.Instance, len(removed))
 	for _, re := range removed {
-		e.deregisterProxied(ctx, rd, re.svc, re.inst)
+		if _, exists := removedByService[re.svc]; !exists {
+			removedByService[re.svc] = re.inst
+		}
+	}
+	for svc, in := range removedByService {
+		e.deregisterProxied(ctx, rd, svc, in)
 	}
 
 	// 重启后本地 registered 为空，无法覆盖历史残留；目标枚举成功后再按真实服务集合清理。
@@ -1430,10 +1438,18 @@ func (e *Engine) reconcileDisappearedDubboServices(ctx context.Context, rd *runn
 			e.setErr(d.ID, fmt.Errorf("query disappeared target dubbo service %s: %w", svc, err))
 			continue
 		}
+		owned := false
+		var representative model.Instance
 		for _, in := range targets {
 			if isOurs(in, d.SrcCID, d.ID) {
-				e.deregisterProxied(ctx, rd, svc, in)
+				owned = true
+				representative = in
+				break
 			}
+		}
+		if owned {
+			// One RPC removes this connection's complete publisher for svc.
+			e.deregisterProxied(ctx, rd, svc, representative)
 		}
 	}
 }
@@ -1571,14 +1587,21 @@ type regOp struct {
 func (e *Engine) dispatchOps(ctx context.Context, rd *runningDir, ops []regOp) {
 	// SDK v2.3.5 keeps one redo-publication per (group, service) and
 	// BatchRegisterInstance replaces that publication with the full instance set.
-	// Apply removals first (DeregisterInstance clears the SDK redo cache for the
-	// whole service), then publish the complete remaining desired set once.
+	// Server-side deregistration removes this connection's whole publisher for
+	// the service, so collapse any number of instance removals into one RPC.
+	// Apply removals first, then publish the complete remaining desired set once.
 	touched := make(map[string]struct{})
+	removals := make(map[string]regOp)
 	for _, op := range ops {
 		touched[op.svc] = struct{}{}
 		if !op.add {
-			e.deregisterProxied(ctx, rd, op.svc, op.in)
+			if _, exists := removals[op.svc]; !exists {
+				removals[op.svc] = op
+			}
 		}
+	}
+	for svc, op := range removals {
+		e.deregisterProxied(ctx, rd, svc, op.in)
 	}
 	for svc := range touched {
 		e.registerServiceProxied(ctx, rd, svc)
