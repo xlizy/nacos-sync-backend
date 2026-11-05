@@ -83,7 +83,7 @@ const (
 	// dubboDiscoCache：动态服务枚举结果的共享有效期。快轮询与全量对账共用缓存，
 	// 到期后重新向当前方向的源 Nacos 查询；双向方向分别查询两端，正常情况下每 10 秒一次。
 	// 枚举失败时沿用上次成功结果（stale），下一周期重试，不让实例同步整体停摆。
-	dubboDiscoCache = 10 * time.Second
+	dubboDiscoCache = 30 * time.Second
 )
 
 // dubboPrefixes dubbo 服务名前缀（已与业务方确认：dubbo 应用按接口注册，服务名均为这两个前缀）。
