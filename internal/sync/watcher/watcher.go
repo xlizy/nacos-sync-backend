@@ -50,6 +50,7 @@ type poller struct {
 	done       chan struct{}
 	ctx        context.Context
 	cancel     context.CancelFunc
+	stopOnce   sync.Once
 	mu         sync.Mutex
 	lastOK     time.Time
 	lastDigest string
@@ -60,7 +61,6 @@ type Manager struct {
 	mgr         *config.Manager
 	logger      *zap.Logger
 	mu          sync.Mutex
-	reconcileMu sync.Mutex // 串行化慢速建连阶段，避免并发 reconcile 互相覆盖
 	pollers     map[string]*poller
 
 	// refresh 可在测试中替换（依赖注入）；生产路径为 refreshGroup。
@@ -193,14 +193,14 @@ func (w *Manager) reconcile(cfg *config.Config) {
 	for id, p := range started {
 		g, stillDesired := currentDesired[id]
 		if !stillDesired || g.DBDSN != p.dsn {
-			p.stop()
+			toStop = append(toStop, p)
 			continue
 		}
 		if existing, ok := w.pollers[id]; ok {
 			// reconcileMu 保证不会有另一个 reconcile 并发安装；若仍存在，
 			// 同 DSN 保留现有 poller，不同 DSN 则替换并在锁外停止旧实例。
 			if existing.dsn == p.dsn {
-				p.stop()
+				toStop = append(toStop, p)
 				continue
 			}
 			toStop = append(toStop, existing)
