@@ -506,13 +506,10 @@ func TestPendingDeregisterIsRetainedUntilConfirmed(t *testing.T) {
 	in := model.Instance{Ip: "10.0.0.9", Port: 8080, ClusterName: "DEFAULT"}
 	key := regKey("ORDER", in)
 
-	e.recordPendingDeregister(rd, key, "ORDER", in, false)
-	if got := rd.pendingDeregister[key]; got.entry.svc != "ORDER" || got.force {
-		t.Fatalf("unexpected pending source-removal record: %+v", got)
-	}
 	e.recordPendingDeregister(rd, key, "ORDER", in, true)
-	if got := rd.pendingDeregister[key]; !got.force {
-		t.Fatal("forced service-removal intent must not be downgraded by a later retry")
+	e.recordPendingDeregister(rd, key, "ORDER", in, false)
+	if got := rd.pendingDeregister[key]; got.entry.svc != "ORDER" || !got.force {
+		t.Fatalf("forced service-removal intent must not be downgraded by a later retry: %+v", got)
 	}
 
 	client := stubNamingClient{}
