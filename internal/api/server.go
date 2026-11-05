@@ -60,15 +60,8 @@ type Server struct {
 }
 
 // New 构造、设监听端口并注册路由（不立即监听）。
-// 控制面鉴权：若环境变量 NACOS_SYNC_API_TOKEN 已设置，则对所有非只读接口强制
-// `Authorization: Bearer <token>`；未设置则关闭鉴权（开发/内网默认，避免破坏现有调用）。
+// 所有实例均运行完整控制面；多实例部署采用 Active-Active，不提供 Standby 只读模式。
 func New(mgr *config.Manager, clientMgr *nacos.ClientManager, cfgEngine *configsync.Engine, nameEngine *namingsync.Engine, wk *watcher.Manager, logger *zap.Logger) *Server {
-	return NewWithReadOnly(mgr, clientMgr, cfgEngine, nameEngine, wk, logger, false)
-}
-
-// NewWithReadOnly 在 standby 模式下只开放查询接口；认证登录/登出仍可用，
-// 其它写请求返回 503，避免备用节点误改配置中心中的运行时拓扑。
-func NewWithReadOnly(mgr *config.Manager, clientMgr *nacos.ClientManager, cfgEngine *configsync.Engine, nameEngine *namingsync.Engine, wk *watcher.Manager, logger *zap.Logger, readOnly bool) *Server {
 	h := server.New(server.WithHostPorts(fmt.Sprintf(":%d", DefaultHTTPPort)))
 
 	// 全链路 traceId：每个 HTTP 请求生成一个，写入 context 并绑定到当前 goroutine，
@@ -111,30 +104,10 @@ func NewWithReadOnly(mgr *config.Manager, clientMgr *nacos.ClientManager, cfgEng
 	} else {
 		logger.Warn("RSA credential cipher is ephemeral (generated at startup); set auth.rsa_private_key_pem for multi-instance or stable keys")
 	}
-	// standby 节点只提供只读控制面：不允许通过备用节点修改配置中心或同步拓扑。
-	if readOnly {
-		h.Use(standbyReadOnlyGuard())
-		logger.Info("standby read-only API guard enabled")
-	}
 	// 限流仅作用于高成本的枚举探测接口 /api/lookup，避免放大对受管 Nacos 的探测压力。
 	h.Use(lookupRateLimit())
-	register(h, mgr, clientMgr, cfgEngine, nameEngine, wk, logger, token, jwtSecret, cipher, readOnly)
+	register(h, mgr, clientMgr, cfgEngine, nameEngine, wk, logger, token, jwtSecret, cipher)
 	return &Server{h: h}
-}
-
-// standbyReadOnlyGuard 阻止备用节点上的写操作。认证登录/登出是控制面会话操作，不改变同步配置。
-func standbyReadOnlyGuard() app.HandlerFunc {
-	return func(c context.Context, ctx *app.RequestContext) {
-		method := string(ctx.Method())
-		path := string(ctx.Path())
-		if method == "GET" || method == "HEAD" || method == "OPTIONS" ||
-			(method == "POST" && (path == "/api/auth/login" || path == "/api/auth/logout")) {
-			ctx.Next(c)
-			return
-		}
-		ctx.JSON(consts.StatusServiceUnavailable, utils.H{"error": "standby node is read-only; switch to active mode before writing"})
-		ctx.Abort()
-	}
 }
 
 // lookupRateLimit 对 /api/lookup 做基于真实对端地址的简易令牌桶限流（每分钟 lookupMaxPerMin 次）。
@@ -270,7 +243,7 @@ func maskGroup(g config.NacosGroup) utils.H {
 	}
 }
 
-func register(h *server.Hertz, m *config.Manager, clientMgr *nacos.ClientManager, _ *configsync.Engine, nameEngine *namingsync.Engine, wk *watcher.Manager, logger *zap.Logger, token, jwtSecret string, cipher *auth.CredCipher, readOnly bool) {
+func register(h *server.Hertz, m *config.Manager, clientMgr *nacos.ClientManager, _ *configsync.Engine, nameEngine *namingsync.Engine, wk *watcher.Manager, logger *zap.Logger, token, jwtSecret string, cipher *auth.CredCipher) {
 	// 控制面鉴权：登录 JWT（Authorization: Bearer <jwt>）或静态共享令牌（NACOS_SYNC_API_TOKEN）均可通过；
 	// 存活/指标/登录相关接口（/api/auth/*）免鉴权；auth.enable=false 时全部放行。详见 JWTAuthMiddleware。
 	h.Use(JWTAuthMiddleware(m, jwtSecret, token))
@@ -285,15 +258,6 @@ func register(h *server.Hertz, m *config.Manager, clientMgr *nacos.ClientManager
 			return
 		}
 		ctx.JSON(consts.StatusServiceUnavailable, utils.H{"status": "DOWN", "deps": utils.H{"config_center": detail}})
-	})
-
-	// 运行模式显式暴露，避免 standby 节点的空同步状态被误判为同步故障。
-	h.GET("/api/runtime-mode", func(c context.Context, ctx *app.RequestContext) {
-		mode := "active"
-		if readOnly {
-			mode = "standby"
-		}
-		ctx.JSON(consts.StatusOK, utils.H{"mode": mode, "sync_enabled": !readOnly, "read_only": readOnly})
 	})
 
 	// 鉴权状态：前端据此判断是否需要在请求头附带 Bearer（RADIUS 未配置时回退静态令牌）。
