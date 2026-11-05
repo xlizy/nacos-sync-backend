@@ -59,7 +59,6 @@ import (
 const (
 	metaSyncSource          = "syncSource"
 	metaSyncSourceCluster   = "syncSourceCluster"
-	metaSyncSourceAgent     = "syncSourceAgent"
 	metaSyncSourceDirection = "syncSourceDirection"
 	defaultGroup            = "DEFAULT_GROUP" // 业务服务通常使用 DEFAULT_GROUP
 
@@ -955,7 +954,7 @@ func (e *Engine) sweepScans(cfg *config.Config) []sweepScan {
 	for _, ns := range e.sweepNamespaces(cfg) {
 		for _, g := range cfg.NacosGroup {
 			for _, c := range g.Clusters {
-				key := c.CID + "\x00" + ns
+				key := g.GrpID + "\x00" + c.CID + "\x00" + ns
 				if seen[key] {
 					continue
 				}
@@ -1495,12 +1494,19 @@ type regOp struct {
 // dispatchOps 按收集顺序串行执行一批代注册/注销网络操作。必须在**未持有 rd.mu** 时调用
 // （任务体内部需要 rd.mu）；调用方（fastPoll/syncService）持 rd.opMu，保证写序稳定。
 func (e *Engine) dispatchOps(ctx context.Context, rd *runningDir, ops []regOp) {
+	// SDK v2.3.5 keeps one redo-publication per (group, service) and
+	// BatchRegisterInstance replaces that publication with the full instance set.
+	// Apply removals first (DeregisterInstance clears the SDK redo cache for the
+	// whole service), then publish the complete remaining desired set once.
+	touched := make(map[string]struct{})
 	for _, op := range ops {
-		if op.add {
-			e.registerProxied(ctx, rd, op.svc, op.in)
-		} else {
+		touched[op.svc] = struct{}{}
+		if !op.add {
 			e.deregisterProxied(ctx, rd, op.svc, op.in)
 		}
+	}
+	for svc := range touched {
+		e.registerServiceProxied(ctx, rd, svc)
 	}
 }
 
@@ -1740,7 +1746,6 @@ func (e *Engine) proxiedMetadata(d *direction, in model.Instance) map[string]str
 	}
 	md[metaSyncSource] = "NACOS"
 	md[metaSyncSourceCluster] = d.SrcCID
-	md[metaSyncSourceAgent] = e.agentIP
 	md[metaSyncSourceDirection] = d.ID
 	return md
 }
@@ -1822,81 +1827,84 @@ func (e *Engine) rebuildDstClient(rd *runningDir) {
 // registerProxied 向目标集群发起代注册（临时实例 ephemeral=true，走 gRPC，Nacos 3.x 支持）。
 // 注意：Nacos 3.x 已移除持久实例的 HTTP 写接口，SDK 持久实例注册会被 501 拒绝，故必须用 ephemeral。
 // 生命周期通过本服务的快轮询（瞬时 gRPC 客户端绕过 SDK 缓存）/ TCP 探活 / 周期对账三层主动管理：源实例消失即 DeregisterInstance 注销。
-func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
+func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string, _ model.Instance) {
+	// Recovery paths also publish the complete service snapshot.
+	e.registerServiceProxied(ctx, rd, svc)
+}
+
+// registerServiceProxied publishes the complete desired ephemeral instance set
+// for one service. SDK v2.3.5 caches registrations by service; repeated
+// RegisterInstance calls overwrite that cache, so a reconnect would restore
+// only the last instance. BatchRegisterInstance stores the complete set.
+func (e *Engine) registerServiceProxied(ctx context.Context, rd *runningDir, svc string) {
 	if ctx.Err() != nil {
 		return
 	}
-	// 方向已停止（正在/已经清理）：跳过，避免清理完成后又被注册回来形成残留。
 	rd.mu.Lock()
-	stopped := rd.stopped
+	if rd.stopped {
+		rd.mu.Unlock()
+		return
+	}
 	d := rd.d
+	instances := make([]vo.RegisterInstanceParam, 0)
+	for _, re := range rd.registered {
+		if re.svc != svc {
+			continue
+		}
+		in := re.inst
+		instances = append(instances, vo.RegisterInstanceParam{
+			ServiceName: svc, GroupName: defaultGroup,
+			Ip: in.Ip, Port: in.Port, Weight: in.Weight,
+			Enable: in.Enable, Healthy: in.Healthy, Ephemeral: true,
+			Metadata: e.proxiedMetadata(d, in), ClusterName: in.ClusterName,
+		})
+	}
 	rd.mu.Unlock()
-	if stopped {
+
+	// The preceding deregistration already removed the SDK redo cache. An
+	// empty desired set needs no batch request (the SDK rejects empty batches).
+	if len(instances) == 0 {
 		return
 	}
-	// 直接代注册：源实例来自 Nacos 实例列表（InstancesLive 已返回，即 Nacos 视角下存活的实例），
-	// 不再做额外 TCP 存活门禁——同步服务无法保证能直连每个源实例 pod（K8S 网络策略/仅 Service 可达），
-	// 外部 TCP 复核既不可靠又会误杀正常代注册；源的存活收敛交由 Nacos 心跳（ephemeral 自动过期）+ 运维清理处理。
-	client, cerr := e.dstClient(rd)
-	if cerr != nil {
-		e.logger.Error("register proxied: get dst client failed",
-			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)), zap.Error(cerr))
-		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
-		e.setErr(d.ID, cerr)
+	client, err := e.dstClient(rd)
+	if err != nil {
+		e.setErr(d.ID, err)
 		return
 	}
-	md := e.proxiedMetadata(d, in)
-	ok, err := client.RegisterInstance(vo.RegisterInstanceParam{
-		ServiceName: svc,
-		GroupName:   defaultGroup,
-		Ip:          in.Ip,
-		Port:        in.Port,
-		Weight:      in.Weight,
-		Enable:      in.Enable,
-		Healthy:     in.Healthy,
-		Ephemeral:   true, // 走 gRPC 代理：Nacos 3.x 已移除实例 HTTP OpenAPI（实测 501），仅 gRPC 可用；2.1.2 同样支持 gRPC，跨版本统一。生命周期仍由本服务托管（源注销→目标注销），但 ephemeral 在服务端自动过期，agent 崩溃也不会留永久孤儿，比 persistent 更安全。
-		Metadata:    md,
-		ClusterName: in.ClusterName,
+	ok, err := client.BatchRegisterInstance(vo.BatchRegisterInstanceParam{
+		ServiceName: svc, GroupName: defaultGroup, Instances: instances,
 	})
 	if err == nil && !ok {
-		err = fmt.Errorf("nacos rejected register instance")
+		err = fmt.Errorf("nacos rejected batch register instances")
 	}
 	if err != nil {
-		// 注册失败必须回滚应然登记：entry 留在 registered 里，fastPoll 会判「已登记」永不重试，
-		// 只能靠兜底对账补救——一旦对账也不可信即长期缺失（2026-10-23 发版换 IP 偶发缺实例根因）。
-		// 回滚后下一轮 fastPoll（≤1s）重新登记并重试。failCount 节流防目标故障期日志刷屏。
-		rk := regKey(svc, in)
+		// Roll back this service's local desired snapshot so the next fast poll
+		// reconstructs it from the source and retries the entire batch.
 		rd.mu.Lock()
-		if cur, ok := rd.registered[rk]; ok && instKey(cur.inst) == instKey(in) {
-			delete(rd.registered, rk)
+		for rk, re := range rd.registered {
+			if re.svc == svc {
+				delete(rd.registered, rk)
+				rd.failCount[rk]++
+			}
 		}
-		n := rd.failCount[rk] + 1
-		rd.failCount[rk] = n
 		rd.mu.Unlock()
-		if n == 1 || n%60 == 0 {
-			e.logger.Error("register proxied failed",
-				zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)),
-				zap.Int("failCount", n), zap.Error(err))
-		} else {
-			e.logger.Debug("register proxied failed (retrying)",
-				zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)),
-				zap.Int("failCount", n), zap.Error(err))
-		}
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
-		e.setErr(d.ID, err) // 暴露真实失败，避免 /api/naming-sync 的 last_error 被掩盖为空
-		// 目标集群节点重启等连接层故障：重建本方向专属目标客户端（关闭旧连接、新建连接），下次写操作即自愈。
+		e.setErr(d.ID, err)
+		e.logger.Error("batch register proxied failed",
+			zap.String("dir", d.ID), zap.String("svc", svc),
+			zap.Int("instances", len(instances)), zap.Error(err))
 		e.rebuildDstClient(rd)
 		return
 	}
-	// 成功：清掉此前失败计数（若有）。
 	rd.mu.Lock()
-	delete(rd.failCount, regKey(svc, in))
+	for _, p := range instances {
+		delete(rd.failCount, regKey(svc, model.Instance{Ip: p.Ip, Port: p.Port, ClusterName: p.ClusterName}))
+	}
 	rd.mu.Unlock()
-	e.logger.Info("register proxied ok",
-		zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)))
+	e.logger.Info("batch register proxied ok",
+		zap.String("dir", d.ID), zap.String("svc", svc), zap.Int("instances", len(instances)))
 	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 }
-
 // deregisterProxied 从目标集群注销本方向的代注册实例（源已消失/崩溃时调用）。
 func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
 	if ctx.Err() != nil {
