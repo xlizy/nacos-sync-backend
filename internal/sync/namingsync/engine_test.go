@@ -499,3 +499,28 @@ func TestCleanupDirectionUsesBoundedConcurrentDeregistration(t *testing.T) {
 		t.Fatal("cleanup must mark direction stopped")
 	}
 }
+
+func TestPendingDeregisterIsRetainedUntilConfirmed(t *testing.T) {
+	e := &Engine{logger: zap.NewNop()}
+	rd := &runningDir{}
+	in := model.Instance{Ip: "10.0.0.9", Port: 8080, ClusterName: "DEFAULT"}
+	key := regKey("ORDER", in)
+
+	e.recordPendingDeregister(rd, key, "ORDER", in, false)
+	if got := rd.pendingDeregister[key]; got.entry.svc != "ORDER" || got.force {
+		t.Fatalf("unexpected pending source-removal record: %+v", got)
+	}
+	e.recordPendingDeregister(rd, key, "ORDER", in, true)
+	if got := rd.pendingDeregister[key]; !got.force {
+		t.Fatal("forced service-removal intent must not be downgraded by a later retry")
+	}
+
+	client := stubNamingClient{}
+	rd.dstClient = client
+	if !e.deregisterProxied(context.Background(), rd, "ORDER", in, true) {
+		t.Fatal("successful deregistration should be acknowledged")
+	}
+	if _, ok := rd.pendingDeregister[key]; ok {
+		t.Fatal("successful deregistration must clear pending retry state")
+	}
+}
