@@ -396,6 +396,44 @@ func TestDispatchOpsRepublishesRemainingBatch(t *testing.T) {
 	}
 }
 
+// TestDispatchOpsDeduplicatesDeregistrationPerService verifies that removing
+// several instances from one Nacos service sends only one deregistration RPC,
+// followed by one complete batch publication of the remaining desired set.
+func TestDispatchOpsDeduplicatesDeregistrationPerService(t *testing.T) {
+	client := batchDeregisterNamingClient{
+		batches: make(chan vo.BatchRegisterInstanceParam, 4),
+		removed: make(chan vo.DeregisterInstanceParam, 4),
+	}
+	e := &Engine{logger: zap.NewNop()}
+	remaining := model.Instance{Ip: "10.0.0.9", Port: 8080, Weight: 1, Enable: true, Healthy: true}
+	rd := &runningDir{
+		d: &direction{ID: "g/s->g/d/", SrcCID: "s", DstCID: "d"},
+		dstClient: client,
+		registered: map[string]regEntry{
+			regKey("TEST-SVC", remaining): {svc: "TEST-SVC", inst: remaining},
+		},
+		failCount: map[string]int{},
+		dead: map[string]regEntry{},
+	}
+	ops := []regOp{
+		{add: false, svc: "TEST-SVC", in: model.Instance{Ip: "10.0.0.1", Port: 8080}},
+		{add: false, svc: "TEST-SVC", in: model.Instance{Ip: "10.0.0.2", Port: 8080}},
+		{add: false, svc: "TEST-SVC", in: model.Instance{Ip: "10.0.0.3", Port: 8080}},
+	}
+	e.dispatchOps(context.Background(), rd, ops)
+
+	if got := len(client.removed); got != 1 {
+		t.Fatalf("sent %d deregistration RPCs for one service, want 1", got)
+	}
+	if got := len(client.batches); got != 1 {
+		t.Fatalf("sent %d batch registrations for one service, want 1", got)
+	}
+	batch := <-client.batches
+	if len(batch.Instances) != 1 || batch.Instances[0].Ip != remaining.Ip {
+		t.Fatalf("expected one full remaining publication, got %+v", batch.Instances)
+	}
+}
+
 // TestRegisterProxiedPublishesWholeService verifies that a single recovery/add
 // operation publishes every locally desired instance for the service in one batch,
 // and that node-specific metadata cannot cause Active-Active nodes to overwrite it.
