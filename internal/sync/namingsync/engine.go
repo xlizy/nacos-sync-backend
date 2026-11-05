@@ -149,11 +149,6 @@ type regEntry struct {
 	inst model.Instance
 }
 
-type pendingDeregister struct {
-	entry regEntry
-	force bool // service removed from this direction; do not cancel merely because source still exists
-}
-
 // discoState dubbo 动态方向「源集群服务枚举」的共享状态（按方向独占，字段读写均持 discoMu）。
 type discoState struct {
 	discoMu   sync.Mutex
@@ -179,7 +174,6 @@ type runningDir struct {
 	opMu       sync.Mutex
 	mu         sync.Mutex
 	registered map[string]regEntry // 当前已在目标代注册的源原生实例（快手路径的“应然”集合），key=regKey
-	pendingDeregister map[string]pendingDeregister // 注销失败的实例；下一轮重试，避免从本地状态移除后永久失去重试依据
 	failCount  map[string]int      // 各源实例连续 TCP 探活失败次数，key=regKey
 	dead       map[string]regEntry // 已被探活判定崩溃、待 Nacos 最终确认的源实例，key=regKey（期间禁止重建，保留实例本体以便自愈）
 	stopped    bool                // 方向已停止（准备/正在清理）：此后拒绝新的代注册，防清理后残留
@@ -472,7 +466,7 @@ func (e *Engine) refreshRunningDirection(d *direction) {
 		e.logger.Info("direction service list changed, cleaning removed services",
 			zap.String("dir", d.ID), zap.Int("count", len(removed)))
 		for _, re := range removed {
-			e.deregisterProxied(e.ctx, rd, re.svc, re.inst, true)
+			e.deregisterProxied(e.ctx, rd, re.svc, re.inst)
 		}
 	}
 }
@@ -679,7 +673,6 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 		d:          d,
 		dstClient:  dstCli,
 		registered: make(map[string]regEntry),
-		pendingDeregister: make(map[string]pendingDeregister),
 		failCount:  make(map[string]int),
 		dead:       make(map[string]regEntry),
 	}
@@ -845,11 +838,7 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 	for _, re := range rd.dead {
 		entries = append(entries, re)
 	}
-	for _, pending := range rd.pendingDeregister {
-		entries = append(entries, pending.entry)
-	}
 	rd.registered = make(map[string]regEntry)
-	rd.pendingDeregister = make(map[string]pendingDeregister)
 	rd.dead = make(map[string]regEntry)
 	rd.failCount = make(map[string]int)
 	rd.mu.Unlock()
@@ -1408,7 +1397,7 @@ func (e *Engine) reconcileDisappearedDubboServices(ctx context.Context, rd *runn
 	}
 	rd.mu.Unlock()
 	for _, re := range removed {
-		e.deregisterProxied(ctx, rd, re.svc, re.inst, true)
+		e.deregisterProxied(ctx, rd, re.svc, re.inst)
 	}
 
 	// 重启后本地 registered 为空，无法覆盖历史残留；目标枚举成功后再按真实服务集合清理。
@@ -1433,7 +1422,7 @@ func (e *Engine) reconcileDisappearedDubboServices(ctx context.Context, rd *runn
 		}
 		for _, in := range targets {
 			if isOurs(in, d.SrcCID, d.ID) {
-				e.deregisterProxied(ctx, rd, svc, in, true)
+				e.deregisterProxied(ctx, rd, svc, in)
 			}
 		}
 	}
@@ -1557,7 +1546,6 @@ func (e *Engine) fastPoll(ctx context.Context, rd *runningDir) {
 	if queryFailed && forceRepublish {
 		rd.republishAll.Store(true)
 	}
-	e.flushPendingDeregistrations(ctx, rd)
 	e.updateCounts(rd)
 }
 
@@ -1579,7 +1567,7 @@ func (e *Engine) dispatchOps(ctx context.Context, rd *runningDir, ops []regOp) {
 	for _, op := range ops {
 		touched[op.svc] = struct{}{}
 		if !op.add {
-			e.deregisterProxied(ctx, rd, op.svc, op.in, false)
+			e.deregisterProxied(ctx, rd, op.svc, op.in)
 		}
 	}
 	for svc := range touched {
@@ -1724,7 +1712,6 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 	if failed && forceRepublish {
 		rd.republishAll.Store(true)
 	}
-	e.flushPendingDeregistrations(ctx, rd)
 	e.updateCounts(rd)
 	if failed {
 		return // 保留本轮错误详情，不用 ok 覆盖
@@ -2040,11 +2027,9 @@ func (e *Engine) registerServiceProxied(ctx context.Context, rd *runningDir, svc
 	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
 }
 // deregisterProxied 从目标集群注销本方向的代注册实例（源已消失/崩溃时调用）。
-func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance, force bool) bool {
-	key := regKey(svc, in)
+func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc string, in model.Instance) {
 	if ctx.Err() != nil {
-		e.recordPendingDeregister(rd, key, svc, in, force)
-		return false
+		return
 	}
 	d := rd.direction()
 	client, cerr := e.dstClient(rd)
@@ -2053,8 +2038,7 @@ func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc stri
 			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)), zap.Error(cerr))
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 		e.setErr(d.ID, cerr)
-		e.recordPendingDeregister(rd, key, svc, in, force)
-		return false
+		return
 	}
 	ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
 		ServiceName: svc,
@@ -2072,75 +2056,13 @@ func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc stri
 		e.logger.Error("deregister proxied failed",
 			zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)), zap.Error(err))
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
-		e.recordPendingDeregister(rd, key, svc, in, force)
 		// 目标集群节点重启等连接层故障：重建本方向专属目标客户端（关闭旧连接、新建连接），下次写操作即自愈。
 		e.rebuildDstClient(rd)
-		return false
+		return
 	}
-	rd.mu.Lock()
-	delete(rd.pendingDeregister, key)
-	rd.mu.Unlock()
 	e.logger.Info("deregister proxied ok",
 		zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)))
 	metrics.ReconcileDrift.WithLabelValues(d.ID).Inc()
-	return true
-}
-
-func (e *Engine) recordPendingDeregister(rd *runningDir, key, svc string, in model.Instance, force bool) {
-	rd.mu.Lock()
-	if rd.pendingDeregister == nil {
-		rd.pendingDeregister = make(map[string]pendingDeregister)
-	}
-	if old, ok := rd.pendingDeregister[key]; ok && old.force {
-		force = true
-	}
-	rd.pendingDeregister[key] = pendingDeregister{entry: regEntry{svc: svc, inst: in}, force: force}
-	rd.mu.Unlock()
-}
-
-// flushPendingDeregistrations retries failed removals. For source-disappearance
-// removals, it rechecks the source first and cancels the pending delete if the
-// same instance has returned. Forced removals (service removed from config)
-// are retried regardless of source presence.
-func (e *Engine) flushPendingDeregistrations(ctx context.Context, rd *runningDir) {
-	rd.mu.Lock()
-	pending := make(map[string]pendingDeregister, len(rd.pendingDeregister))
-	for key, item := range rd.pendingDeregister {
-		pending[key] = item
-	}
-	rd.mu.Unlock()
-	if len(pending) == 0 {
-		return
-	}
-	d := rd.direction()
-	sourceCache := make(map[string]map[string]model.Instance)
-	for key, item := range pending {
-		if ctx.Err() != nil {
-			return
-		}
-		// If the service has since been re-added to this direction, treat the
-		// old forced removal as cancellable and preserve the newly desired instance.
-		mustForce := item.force && !directionManagesService(d, item.entry.svc)
-		if !mustForce {
-			natives, cached := sourceCache[item.entry.svc]
-			if !cached {
-				list, err := e.mgr.InstancesLive(d.SrcCID, d.Namespace, item.entry.svc, defaultGroup)
-				if err != nil {
-					e.setErr(d.ID, fmt.Errorf("retry deregister: query source %s: %w", item.entry.svc, err))
-					continue
-				}
-				natives = filterNatives(list)
-				sourceCache[item.entry.svc] = natives
-			}
-			if _, exists := natives[instKey(item.entry.inst)]; exists {
-				rd.mu.Lock()
-				delete(rd.pendingDeregister, key)
-				rd.mu.Unlock()
-				continue
-			}
-		}
-		e.deregisterProxied(ctx, rd, item.entry.svc, item.entry.inst, mustForce)
-	}
 }
 
 func (e *Engine) setOK(id string) {
