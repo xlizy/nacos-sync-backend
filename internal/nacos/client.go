@@ -114,25 +114,36 @@ func NewClientManager(conf *config.Manager) *ClientManager {
 	return m
 }
 
-// connFor 按 c_id 在运行时配置的 nacos-group 中查找对应集群连接信息。
-// 注：c_id 在分组内唯一；跨分组极小概率碰撞（4 位字母数字），这里取首个匹配。
+// connFor 按全局唯一的 c_id 查找集群连接信息。若存量配置存在重复 ID，明确失败，
+// 绝不静默选择第一个分组，避免客户端缓存串到错误的 Nacos 集群。
 func (m *ClientManager) connFor(cid string) (clusterConn, error) {
 	cfg := m.conf.Get()
+	var found *clusterConn
+	var foundGroup string
 	for _, g := range cfg.NacosGroup {
 		for _, cl := range g.Clusters {
-			if cl.CID == cid {
-				return clusterConn{
-					CID:        cl.CID,
-					Nodes:      cl.CNodes,
-					GrpVersion: g.GrpVersion,
-					EnableAuth: g.EnableAuth,
-					Username:   g.AuthUsername,
-					Password:   g.AuthPassword,
-				}, nil
+			if cl.CID != cid {
+				continue
 			}
+			if found != nil {
+				return clusterConn{}, fmt.Errorf("ambiguous cluster ID %q: appears in groups %q and %q; c_id must be globally unique", cid, foundGroup, g.GrpID)
+			}
+			conn := clusterConn{
+				CID:        cl.CID,
+				Nodes:      append([]string(nil), cl.CNodes...),
+				GrpVersion: g.GrpVersion,
+				EnableAuth: g.EnableAuth,
+				Username:   g.AuthUsername,
+				Password:   g.AuthPassword,
+			}
+			found = &conn
+			foundGroup = g.GrpID
 		}
 	}
-	return clusterConn{}, fmt.Errorf("unknown cluster %q", cid)
+	if found == nil {
+		return clusterConn{}, fmt.Errorf("unknown cluster %q", cid)
+	}
+	return *found, nil
 }
 
 func (m *ClientManager) serverConfigs(c clusterConn) []constant.ServerConfig {
