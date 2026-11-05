@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,7 @@ type Engine struct {
 	logger *zap.Logger
 
 	mu         sync.Mutex
+	forwardLocks [64]sync.Mutex // bounded striped locks serialize writes for the same config key
 	parentCtx  context.Context               // 引擎生命周期 ctx（Start 时设置），供 reconcile 启动新链路派生
 	stops      map[string]context.CancelFunc // linkKey -> 取消函数（link 级生命周期）
 	linkCtxs   map[string]context.Context    // linkKey -> 该 link 的 ctx（供各命名空间监听派生，stop 时整条链路取消）
@@ -530,6 +532,17 @@ func (e *Engine) onChange(ctx context.Context, link config.SyncLink, ns, group, 
 // 失败时按指数退避重试（有界次数）；读取源端失败时绝不回退使用旧 payload。
 // 成功后 recordPush 内容以实际发布内容为准。返回最终错误供调用方聚合判断。
 func (e *Engine) forward(ctx context.Context, link config.SyncLink, ns, group, dataId, data string, src, tgt config_client.IConfigClient) error {
+	// Serialize all in-process writes for one logical config key. A fresh source
+	// read alone is insufficient: two tasks can read old/new values and publish
+	// them in reverse order. Fixed stripes bound memory; unrelated keys may
+	// occasionally serialize on a hash collision.
+	lockKey := pushKey(link.From, link.To, ns, group, dataId)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(lockKey))
+	lock := &e.forwardLocks[h.Sum32()%uint32(len(e.forwardLocks))]
+	lock.Lock()
+	defer lock.Unlock()
+
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
