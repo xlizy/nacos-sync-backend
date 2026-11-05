@@ -69,6 +69,23 @@ func TestDirectionManagesService(t *testing.T) {
 	}
 }
 
+func TestSweepScansDistinguishesSameCIDAcrossGroups(t *testing.T) {
+	e := &Engine{}
+	cfg := &config.Config{
+		NacosGroup: []config.NacosGroup{
+			{GrpID: "group-a", Clusters: []config.NacosCluster{{CID: "shared"}}},
+			{GrpID: "group-b", Clusters: []config.NacosCluster{{CID: "shared"}}},
+		},
+	}
+	scans := e.sweepScans(cfg)
+	if len(scans) != 2 {
+		t.Fatalf("same CID in different groups must produce two sweep targets, got %+v", scans)
+	}
+	if scans[0].label() == scans[1].label() {
+		t.Fatalf("group-qualified sweep targets must be distinct: %+v", scans)
+	}
+}
+
 func TestPruneOrphanSeen(t *testing.T) {
 	e := &Engine{orphanSeen: make(map[string]time.Time)}
 	scan := sweepScan{dstGrp: "g", dstCID: "dst", ns: ""}
