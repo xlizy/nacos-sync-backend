@@ -673,7 +673,6 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 	if e.worker != nil {
 		if err := e.worker.Ensure(workerCli, d.DstCID, d.Namespace, d.ID); err != nil {
 			e.mgr.CloseDedicatedNamingClient(workerCli)
-			e.mgr.CloseDedicatedNamingClient(dstCli)
 			rd.workerClient = nil
 			e.setErr(d.ID, fmt.Errorf("register worker heartbeat: %w", err))
 			e.stopDir(d.ID)
@@ -839,10 +838,6 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 	e.logger.Info("cleanup direction: closing per-instance publishers",
 		zap.String("dir", d.ID), zap.Int("clients", len(clients)), zap.Int("instances", len(entries)))
 	for _, client := range clients {
-		if ctx.Err() != nil {
-			e.logger.Warn("cleanup direction timed out; remaining ephemeral publishers will be closed on process exit", zap.String("dir", d.ID))
-			return
-		}
 		if e.mgr != nil { e.mgr.CloseDedicatedNamingClient(client) }
 	}
 }
