@@ -95,7 +95,7 @@ func hasOwnWorker(instances []model.Instance, want vo.RegisterInstanceParam) boo
 func WorkerScopes(instances []model.Instance) map[string]bool {
 	out := make(map[string]bool)
 	for _, in := range instances {
-		if !in.Enable || !in.Healthy {
+		if !in.Ephemeral || !in.Enable || !in.Healthy || in.Metadata[workerIDMeta] == "" {
 			continue
 		}
 		if scope := in.Metadata[workerDirectionMeta]; scope != "" {
@@ -103,6 +103,25 @@ func WorkerScopes(instances []model.Instance) map[string]bool {
 		}
 	}
 	return out
+}
+
+// HasOtherWorker reports whether a different healthy ephemeral Worker still maintains scope.
+// It is used during graceful shutdown to avoid deregistering instances that a peer is reconciling.
+func HasOtherWorker(instances []model.Instance, scope string, self *DirectionWorker) bool {
+	if self == nil {
+		return false
+	}
+	for _, in := range instances {
+		if !in.Ephemeral || !in.Enable || !in.Healthy ||
+			in.Metadata[workerDirectionMeta] != scope || in.Metadata[workerIDMeta] == "" {
+			continue
+		}
+		if in.Ip == self.agentIP && in.Port == self.agentPort && in.Metadata[workerIDMeta] == self.workerID {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // Leave withdraws this process's Worker heartbeat. The caller must do this only after
