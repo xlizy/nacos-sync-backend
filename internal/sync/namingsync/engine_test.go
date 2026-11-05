@@ -219,6 +219,23 @@ func TestFilterNativesPreservesSameEndpointPublisherVariants(t *testing.T) {
 // TestGroupCrossDirections 锁定组外同步拓扑：A、B 两组「全互联」——
 // 每组每个集群 ↔ 对方组每个集群（双向），方向数 = |A集群| × |B集群| × 2。
 // 历史回归点：早期版本只挑各组「主集群」，导致服务注册在非主集群时完全同步不出去。
+func TestValidateUniquePublishers(t *testing.T) {
+	base := model.Instance{Ip: "10.0.0.8", Port: 8080, ClusterName: "DEFAULT", Weight: 1, Enable: true, Healthy: true}
+	first := base
+	first.Metadata = map[string]string{"version": "v1"}
+	second := base
+	second.Metadata = map[string]string{"version": "v2"}
+	conflict := map[string]model.Instance{instanceSpecKey(first): first, instanceSpecKey(second): second}
+	if err := validateUniquePublishers(conflict); err == nil {
+		t.Fatal("one direction client must reject distinct publisher records sharing one endpoint")
+	}
+	second.Ip = "10.0.0.9"
+	independent := map[string]model.Instance{instanceSpecKey(first): first, instanceSpecKey(second): second}
+	if err := validateUniquePublishers(independent); err != nil {
+		t.Fatalf("different endpoints should be representable: %v", err)
+	}
+}
+
 func TestGroupCrossDirections(t *testing.T) {
 	ga := config.NacosGroup{Clusters: []config.NacosCluster{{CID: "a1"}, {CID: "a2"}}}
 	gb := config.NacosGroup{Clusters: []config.NacosCluster{{CID: "b1"}}}
