@@ -49,16 +49,16 @@ export NACOS_SYNC_JWT_SECRET=...   # JWT 签名密钥（缺省回退 secret-key�
 export NACOS_SYNC_API_TOKEN=...    # 静态共享令牌（机器/脚本旁路鉴权）
 ```
 
-## 主备部署
+## 多节点部署与 Worker 心跳
 
 支持通过环境变量 `NACOS_SYNC_MODE` 选择运行模式：
 
-- `active`（默认）：启动 ConfigSync、NamingSync、watcher，并向 Nacos 注册工作节点。
-- `standby`：不启动任何同步引擎、不向 Nacos 注册工作节点；保留 HTTP 控制面与健康检查，写请求返回 HTTP 503，只允许查询及登录/登出。可通过 `GET /api/runtime-mode` 确认当前模式（返回 `mode`、`sync_enabled`、`read_only`）。
+- `active`（默认）：启动 ConfigSync、NamingSync、watcher，并参与所有配置方向的同步。
+- `standby`：不启动同步引擎、不登记 Worker 心跳；保留 HTTP 控制面与健康检查，写请求返回 HTTP 503，只允许查询及登录/登出。可通过 `GET /api/runtime-mode` 确认当前模式（返回 `mode`、`sync_enabled`、`read_only`）。
 
-推荐部署 1 主 1 备：A 使用默认 `active`，B 设置 `NACOS_SYNC_MODE=standby`。故障切换必须先确认 A 进程已停止或主机已隔离，再将 B 切换为 `active`（重启进程生效）。A 恢复后保持停止，直到确认 B 已停止并完成反向切换。不要仅凭健康检查失败自动提升备用节点；网络分区或进程暂停可能造成双主。
+NamingSync 支持多个 `active` 节点同时运行相同配置。每个节点针对每条目标方向，在目标 Nacos 的 `NACOS-SYNC-WORKER` 服务中登记独立的 ephemeral Worker 心跳；多个 Worker 可以同时维护同一方向，不进行 Leader 选举。孤儿清扫根据健康 Worker 心跳判断方向是否仍被维护，心跳查询失败时本轮清扫失败关闭。方向停止时先清理本节点数据面连接，再撤销 Worker 心跳；若其他 Worker 仍存活，本节点不会主动注销该方向的共享代注册实例。
 
-standby 模式不提供自动故障转移，也不构成分布式 fencing；同一时刻只能由运维流程保证一个 active 实例。
+可继续使用 `standby` 作为只读管理节点。standby 不会自动提升为 active；是否启用节点由部署编排或运维流程决定。Worker 心跳用于维护状态发现和孤儿保护，不是分布式 fencing，也不能替代 Nacos 集群自身的可用性与网络隔离机制。
 
 ## 控制面 API（9696）
 
