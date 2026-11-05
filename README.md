@@ -34,13 +34,11 @@ configs/runtime-config.example.yaml  运行时配置 schema 示例（实际存�
 
 ## 运行
 ```bash
-# 主节点：默认 active，启动 NamingSync / ConfigSync / watcher
+# 每个节点均以 Active-Active 模式启动完整同步能力
 go run ./cmd/server -c configs/config.yaml
 
-# 备用节点：只开放只读控制面与健康检查，不启动同步引擎
-NACOS_SYNC_MODE=standby NACOS_SYNC_CONFIG=/path/to/config.yaml ./nacos-sync
-
-# NACOS_SYNC_MODE 可选 active（默认）或 standby
+# 其它节点使用相同运行方式和运行时同步拓扑
+NACOS_SYNC_CONFIG=/path/to/config.yaml ./nacos-sync
 
 # 必需环境变量
 export NACOS_SYNC_SECRET_KEY=...   # ENC(...) 加解密主密钥（引导配置 secret-key 占位注入）
@@ -51,14 +49,14 @@ export NACOS_SYNC_API_TOKEN=...    # 静态共享令牌（机器/脚本旁路鉴
 
 ## 多节点部署与 Worker 心跳
 
-支持通过环境变量 `NACOS_SYNC_MODE` 选择运行模式：
+系统只支持 **Active-Active** 部署：
 
-- `active`（默认）：启动 ConfigSync、NamingSync、watcher，并参与所有配置方向的同步。
-- `standby`：不启动同步引擎、不登记 Worker 心跳；保留 HTTP 控制面与健康检查，写请求返回 HTTP 503，只允许查询及登录/登出。可通过 `GET /api/runtime-mode` 确认当前模式（返回 `mode`、`sync_enabled`、`read_only`）。
-
-NamingSync 支持多个 `active` 节点同时运行相同配置。每个节点针对每条目标方向，在目标 Nacos 的 `NACOS-SYNC-WORKER` 服务中登记独立的 ephemeral Worker 心跳；多个 Worker 可以同时维护同一方向，不进行 Leader 选举。孤儿清扫根据健康 Worker 心跳判断方向是否仍被维护，心跳查询失败时本轮清扫失败关闭。方向停止时先清理本节点数据面连接，再撤销 Worker 心跳；若其他 Worker 仍存活，本节点不会主动注销该方向的共享代注册实例。
-
-可继续使用 `standby` 作为只读管理节点。standby 不会自动提升为 active；是否启用节点由部署编排或运维流程决定。Worker 心跳用于维护状态发现和孤儿保护，不是分布式 fencing，也不能替代 Nacos 集群自身的可用性与网络隔离机制。
+- 每个实例启动 ConfigSync、NamingSync 和 watcher，并参与配置中启用的同步方向。
+- 多个实例可以同时运行相同拓扑、同时维护相同方向；不进行 Leader 选举，不使用主备切换，也没有自动 promote。
+- 每个实例针对每条目标方向，在目标 Nacos 的 `NACOS-SYNC-WORKER` 服务中登记独立的 ephemeral Worker 心跳。
+- Worker 心跳用于方向存活发现和孤儿保护，不是选主、分布式锁或 fencing。若其他 Worker 仍存活，某实例停止时不会主动注销该方向的共享代注册实例。
+- 所有实例均提供完整控制面；写操作由任一实例处理后，通过配置中心热更新同步拓扑。多实例部署应使用一致的引导配置、运行时配置和认证密钥。
+- 节点故障后，其它 Active 实例继续工作；故障节点恢复后重新登记 Worker 并参与同步。Worker 心跳不替代 Nacos 集群自身的可用性与网络隔离机制。
 
 ## 控制面 API（9696）
 
