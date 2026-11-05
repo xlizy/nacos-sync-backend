@@ -364,7 +364,6 @@ func TestRegisterProxiedPublishesWholeService(t *testing.T) {
 		if !found["10.0.0.1"] || !found["10.0.0.2"] {
 			t.Fatalf("batch lost an instance: %+v", found)
 		}
-	}:
 	case <-time.After(2 * time.Second):
 		t.Fatal("registerProxied did not call BatchRegisterInstance")
 	}
