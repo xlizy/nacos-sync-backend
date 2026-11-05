@@ -227,3 +227,35 @@ func TestDubboServicesForReconcileEnumOnly(t *testing.T) {
 		t.Fatalf("dubboServicesForReconcile = %v, want %v (enum only when registered empty)", got, enumResult)
 	}
 }
+
+
+// TestDubboDiscoveryInterval 每个方向的原始 Dubbo 服务名枚举缓存周期为 10 秒。
+// 双向方向分别查询各自源端，因此两端都会被周期性枚举。
+func TestDubboDiscoveryInterval(t *testing.T) {
+	if dubboDiscoCache != 10*time.Second {
+		t.Fatalf("dubbo discovery interval = %s, want 10s", dubboDiscoCache)
+	}
+}
+
+// TestFilterNativesDubboSourceMetadata 只排除 syncSource=NACOS 的代注册实例，
+// 保留原始实例以及其它来源标记的实例。
+func TestFilterNativesDubboSourceMetadata(t *testing.T) {
+	src := []model.Instance{
+		{Ip: "10.0.0.1", Port: 20880},
+		{Ip: "10.0.0.2", Port: 20880, Metadata: map[string]string{"syncSource": "NACOS"}},
+		{Ip: "10.0.0.3", Port: 20880, Metadata: map[string]string{"syncSource": "OTHER"}},
+	}
+	got := filterNatives(src)
+	if len(got) != 2 {
+		t.Fatalf("filterNatives retained %d instances, want 2", len(got))
+	}
+	if _, ok := got[instanceSpecKey(src[0])]; !ok {
+		t.Fatal("native instance without syncSource was filtered")
+	}
+	if _, ok := got[instanceSpecKey(src[1])]; ok {
+		t.Fatal("syncSource=NACOS instance must be filtered to prevent loops")
+	}
+	if _, ok := got[instanceSpecKey(src[2])]; !ok {
+		t.Fatal("instance with a different syncSource value must be retained")
+	}
+}

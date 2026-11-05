@@ -80,11 +80,10 @@ const (
 	cleanupConcurrency  = 64               // ④ 单方向并发注销上限，避免数百实例瞬时打满目标 Nacos
 
 	// ---- dubbo 动态方向参数 ----
-	// dubboDiscoCache：动态服务枚举结果的共享有效期。fastPoll（1s）在有效期内直接复用缓存，
-	// 过期才重新枚举源集群；syncService（10s）同样在有效期内复用——源枚举频率被压到 ≤1/2s，
-	// dubbo 服务发现跟随延迟最多 +1s，代价可忽略。枚举失败时沿用上次成功结果（stale），
-	// 下一缓存周期重试，不退避停摆（对账基于实例，stale 安全）。
-	dubboDiscoCache = 2 * time.Second
+	// dubboDiscoCache：动态服务枚举结果的共享有效期。快轮询与全量对账共用缓存，
+	// 到期后重新向当前方向的源 Nacos 查询；双向方向分别查询两端，正常情况下每 10 秒一次。
+	// 枚举失败时沿用上次成功结果（stale），下一周期重试，不让实例同步整体停摆。
+	dubboDiscoCache = 10 * time.Second
 )
 
 // dubboPrefixes dubbo 服务名前缀（已与业务方确认：dubbo 应用按接口注册，服务名均为这两个前缀）。
@@ -96,8 +95,6 @@ type Engine struct {
 	mgr    *nacos.ClientManager
 	pl     *pool.Pool
 	logger *zap.Logger
-
-	worker *nacos.DirectionWorker
 
 	orphanMu   sync.Mutex
 	orphanSeen map[string]time.Time // 首次确认无全局 owner 的时刻；宽限期后才允许删除
@@ -176,8 +173,7 @@ type runningDir struct {
 	// 在连接重连时会被 SDK 自动重注册（见 connection_event_listener.redoRegisterEachService），正是「禁用同步后代注册实例下不了线」的根因。
 	clientMu     sync.Mutex
 	dstClient    naming_client.INamingClient
-	workerClient naming_client.INamingClient // 独立于数据客户端的方向存活登记连接
-	workerDead   atomic.Bool // 任一方向协程异常退出；reconcile 据此重启整个方向
+	directionDead atomic.Bool // 任一方向协程异常退出；reconcile 据此重启整个方向
 	republishAll atomic.Bool // 目标写连接重建后，本方向全部服务都需要重新发布
 }
 
@@ -218,14 +214,12 @@ func splitRegKey(rk string) (svc, ik string) {
 }
 
 // New 构造。
-func New(conf *config.Manager, mgr *nacos.ClientManager, pl *pool.Pool, agentPort uint64, logger *zap.Logger) *Engine {
-	agentIP := conf.AgentIP()
+func New(conf *config.Manager, mgr *nacos.ClientManager, pl *pool.Pool, _ uint64, logger *zap.Logger) *Engine {
 	return &Engine{
 		conf:         conf,
 		mgr:          mgr,
 		pl:           pl,
 		logger:       logger,
-		worker:       nacos.NewDirectionWorker(mgr, agentIP, agentPort),
 		orphanSeen:   make(map[string]time.Time),
 		stops:        make(map[string]context.CancelFunc),
 		dirs:         make(map[string]*direction),
@@ -332,7 +326,7 @@ func (e *Engine) reconcile(cfg *config.Config) {
 		cancel, running := e.stops[d.ID]
 		rd, hasRun := e.runs[d.ID]
 		e.dirs[d.ID] = d
-		if running && hasRun && rd.workerDead.Load() {
+		if running && hasRun && rd.directionDead.Load() {
 			delete(e.stops, d.ID)
 			delete(e.runs, d.ID)
 			running = false
@@ -347,7 +341,7 @@ func (e *Engine) reconcile(cfg *config.Config) {
 			cctx, ccancel := context.WithTimeout(e.ctx, dirCleanupTimeout)
 			e.cleanupDirection(cctx, rd)
 			ccancel()
-			e.logger.Error("naming direction worker exited unexpectedly; restarting",
+			e.logger.Error("naming direction task exited unexpectedly; restarting",
 				zap.String("dir", d.ID))
 		}
 		if !running {
@@ -673,26 +667,7 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 	e.runs[d.ID] = rd
 	e.mu.Unlock()
 
-	// Worker 心跳使用独立连接，不与数据面目标客户端共享生命周期。
-	workerCli, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
-	if err != nil {
-		e.mgr.CloseDedicatedNamingClient(dstCli)
-		e.setErr(d.ID, fmt.Errorf("build worker heartbeat client: %w", err))
-		e.stopDir(d.ID)
-		return
-	}
-	rd.workerClient = workerCli
-	if e.worker != nil {
-		if err := e.worker.Ensure(workerCli, d.DstCID, d.Namespace, d.ID); err != nil {
-			e.mgr.CloseDedicatedNamingClient(workerCli)
-			e.mgr.CloseDedicatedNamingClient(dstCli)
-			rd.workerClient = nil
-			e.setErr(d.ID, fmt.Errorf("register worker heartbeat: %w", err))
-			e.stopDir(d.ID)
-			return
-		}
-	}
-
+	// 同步方向只使用专属数据面连接，不注册 NACOS-SYNC-WORKER，也不依赖心跳。
 	// 初始全量对账：立即把已存在实例代注册出去。
 	e.syncService(ctx, rd)
 
@@ -703,7 +678,7 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 		defer e.wg.Done()
 		defer func() {
 			if ctx.Err() == nil {
-				rd.workerDead.Store(true)
+				rd.directionDead.Store(true)
 			}
 		}()
 		defer func() {
@@ -729,7 +704,7 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 		defer e.wg.Done()
 		defer func() {
 			if ctx.Err() == nil {
-				rd.workerDead.Store(true)
+				rd.directionDead.Store(true)
 			}
 		}()
 		defer func() {
@@ -754,7 +729,7 @@ func (e *Engine) startDirection(parent context.Context, d *direction) {
 		defer e.wg.Done()
 		defer func() {
 			if ctx.Err() == nil {
-				rd.workerDead.Store(true)
+				rd.directionDead.Store(true)
 			}
 		}()
 		defer func() {
@@ -805,22 +780,6 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 	rd.opMu.Lock()
 	defer rd.opMu.Unlock()
 
-	// Worker heartbeat remains visible throughout data-plane cleanup and is withdrawn last.
-	defer func() {
-		rd.clientMu.Lock()
-		workerClient := rd.workerClient
-		rd.workerClient = nil
-		rd.clientMu.Unlock()
-		if e.worker != nil && workerClient != nil {
-			if err := e.worker.Leave(workerClient, d.ID); err != nil {
-				e.logger.Warn("leave naming worker heartbeat failed", zap.String("dir", d.ID), zap.Error(err))
-			}
-		}
-		if workerClient != nil {
-			e.mgr.CloseDedicatedNamingClient(workerClient)
-		}
-	}()
-
 	rd.mu.Lock()
 	rd.stopped = true // 先置停止标记：此后在途/新提交的代注册任务一律跳过，避免清理后又被注册回来
 	entries := make([]regEntry, 0, len(rd.registered)+len(rd.dead))
@@ -852,24 +811,8 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 		return
 	}
 
-	// 若另一个节点仍维护该方向，本节点只能关闭自己的 ephemeral 连接，不能主动注销共享实例。
-	// 查询失败也采取保守策略：跳过主动注销，避免把其他节点仍在维护的实例误删。
-	otherWorker := false
-	if e.worker != nil {
-		workers, err := e.mgr.InstancesLive(d.DstCID, d.Namespace, nacos.WorkerService, defaultGroup)
-		if err != nil {
-			e.logger.Warn("cleanup direction: query Worker heartbeats failed; skip deregistration",
-				zap.String("dir", d.ID), zap.Error(err))
-				return
-		}
-		otherWorker = nacos.HasOtherWorker(workers, d.ID, e.worker)
-	}
-	if otherWorker {
-		e.logger.Info("cleanup direction: another Worker still maintains direction; close only this node's connection",
-			zap.String("dir", d.ID))
-			return
-	}
-
+	// 每个进程使用独立的 ephemeral gRPC 发布连接；关闭本方向连接只回收本连接发布的实例，
+	// 不会影响其它进程仍在维护的同一服务发布。
 	// Nacos v2 的连接客户端对每个 (namespace, group, service) 只保存一个 publisher；
 	// BatchRegisterInstance 把该 publisher 设为完整实例集合，而服务端 DeregisterInstance
 	// 会直接 removeServiceInstance(service)，即一次注销会移除本连接该服务的整份发布集合。
@@ -1046,13 +989,6 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 			e.logger.Warn("orphan sweep: build client failed", zap.String("target", s.label()), zap.Error(err))
 			continue
 		}
-		workerInstances, err := e.mgr.InstancesLive(s.dstCID, s.ns, nacos.WorkerService, defaultGroup)
-		if err != nil {
-			e.logger.Warn("orphan sweep: query active Worker heartbeats failed", zap.String("target", s.label()), zap.Error(err))
-			e.mgr.CloseDedicatedNamingClient(cli)
-			continue // 存活登记查询失败必须 fail-closed：本轮不清理任何实例
-		}
-		activeDirections := nacos.WorkerScopes(workerInstances)
 		names, err := listServiceNames(cli, s.ns)
 		if err != nil {
 			e.logger.Warn("orphan sweep: list services failed", zap.String("target", s.label()), zap.Error(err))
@@ -1080,7 +1016,7 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 				}
 				seenKey := s.label() + "\x00" + regKey(svc, inst)
 				observedOrphans[seenKey] = struct{}{}
-				if e.isGloballyManaged(s, svc, inst, cfg, activeDirections) {
+				if e.isGloballyManaged(s, svc, inst, cfg) {
 					e.clearOrphanSeen(s, svc, inst)
 					continue
 				}
@@ -1112,18 +1048,14 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 	}
 }
 
-// isGloballyManaged 只根据目标集群中仍存活的方向候选判断 owner，绝不使用单节点内存。
-// 新版实例直接携带 syncSourceDirection；旧版实例按配置推导候选方向，任一方向仍存活即保护。
-func (e *Engine) isGloballyManaged(s sweepScan, svc string, inst model.Instance, cfg *config.Config, active map[string]bool) bool {
+// isGloballyManaged 根据当前同步配置和实例归属元数据判断是否仍有方向管理该实例。
+func (e *Engine) isGloballyManaged(s sweepScan, svc string, inst model.Instance, cfg *config.Config) bool {
 	srcCID := inst.Metadata[metaSyncSourceCluster]
 	directions := e.resolveDirections(cfg)
 
-	// 新实例带有方向 ID。只有该方向仍活跃、仍指向当前目标，且当前配置仍
-	// 管理此服务时才保护它；仅凭方向 Worker 心跳存活会让已移出白名单的服务成为永久孤儿。
+	// 新实例带有方向 ID：只要当前配置仍包含该方向，就保留其归属实例。
+	// 不依赖跨节点 Worker 心跳；ephemeral 发布的实际生命周期由各节点自己的 gRPC 连接管理。
 	if dirID := inst.Metadata[metaSyncSourceDirection]; dirID != "" {
-		if !active[dirID] {
-			return false
-		}
 		for _, d := range directions {
 			if d.ID != dirID || d.SrcCID != srcCID || d.DstCID != s.dstCID || d.Namespace != s.ns {
 				continue
@@ -1135,8 +1067,7 @@ func (e *Engine) isGloballyManaged(s sweepScan, svc string, inst model.Instance,
 
 	// 兼容旧版本没有 syncSourceDirection 的实例：从当前拓扑反推归属。
 	for _, d := range directions {
-		if d.SrcCID == srcCID && d.DstCID == s.dstCID && d.Namespace == s.ns &&
-			active[d.ID] && directionManagesService(d, svc) {
+		if d.SrcCID == srcCID && d.DstCID == s.dstCID && d.Namespace == s.ns && directionManagesService(d, svc) {
 			return true
 		}
 	}
@@ -1399,15 +1330,6 @@ func (e *Engine) fastPoll(ctx context.Context, rd *runningDir) {
 		return // 方向已停止，不再读写状态（避免清理后又写入/注册）
 	}
 	d := rd.direction()
-	workerReady, err := e.ensureWorker(rd)
-	if err != nil {
-		e.setErr(d.ID, err)
-		return
-	}
-	if !workerReady {
-		return
-	}
-
 	// 服务名单：静态方向用配置白名单；dubbo 动态方向由 dubboServicesForReconcile
 	// 提供（枚举结果 ∪ registered 服务名），后续对账与静态方向完全一致。
 	var svcs []string
@@ -1575,14 +1497,6 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 		return // 方向已停止，不再读写状态（避免清理后又写入/注册）
 	}
 	d := rd.direction()
-	workerReady, err := e.ensureWorker(rd)
-	if err != nil {
-		e.setErr(d.ID, err)
-		return
-	}
-	if !workerReady {
-		return
-	}
 	// failed 记录本轮是否出现过取数/对账失败：失败时不能用 setOK 覆盖错误，
 	// 否则 /api/naming-sync 的 last_error 永远为空，排查时看不到真实失败原因。
 	var failed bool
@@ -1725,8 +1639,7 @@ func (e *Engine) probe(ctx context.Context, rd *runningDir) {
 		return
 	}
 	// 仅快照 dead 集合：registered 存活实例不参与探活（结果无决策作用，纯 TCP 开销）。
-	// dead 常规恒为空（崩溃判定已移除）：先快照再确认 Worker 心跳，空集合直接返回，
-	// 省掉每 1s tick 一次的Worker 心跳查询（InstancesLive）。
+	// dead 常规恒为空（崩溃判定已移除），空集合直接返回。
 	rd.mu.Lock()
 	if len(rd.dead) == 0 {
 		rd.mu.Unlock()
@@ -1737,14 +1650,6 @@ func (e *Engine) probe(ctx context.Context, rd *runningDir) {
 		snapshot[rk] = re
 	}
 	rd.mu.Unlock()
-
-	workerReady, err := e.ensureWorker(rd)
-	if err != nil || !workerReady {
-		if err != nil {
-			e.setErr(rd.direction().ID, err)
-		}
-		return
-	}
 
 	// 有界并发探活：经引擎级信号量限制同时发起的 TCP 探活数，削去每实例一 goroutine 的风暴
 	// （400 节点下原本每秒凭空数千 goroutine）。信号量全局共享，使所有方向的探活并发受总上限约束。
@@ -1831,47 +1736,6 @@ func (e *Engine) instanceNeedsUpdate(d *direction, src, dst model.Instance) bool
 		return true
 	}
 	return !reflect.DeepEqual(e.proxiedMetadata(d, src), dst.Metadata)
-}
-
-// ensureWorker 在每次对账前确认本节点的方向 Worker 心跳已在目标集群可见。
-// 这是存活登记而非选主：多个 Worker 可以同时写；查询/登记异常时 fail-closed，避免节点在
-// 无法确认自身登记状态时继续工作。
-func (e *Engine) ensureWorker(rd *runningDir) (bool, error) {
-	if e.worker == nil { // 纯单元测试替身不连接真实 Nacos
-		return true, nil
-	}
-	d := rd.direction()
-	rd.clientMu.Lock()
-	cli := rd.workerClient
-	rd.clientMu.Unlock()
-	if cli == nil {
-		return false, fmt.Errorf("direction %s has no Worker heartbeat client", d.ID)
-	}
-	if err := e.worker.Ensure(cli, d.DstCID, d.Namespace, d.ID); err != nil {
-		if !nacos.IsConnectionError(err) {
-			return false, err
-		}
-
-		// The Worker connection is independent from the data-plane connection.
-		// If it becomes UNHEALTHY, retrying Ensure on the same SDK client can
-		// never restore the heartbeat. Replace only this direction's Worker
-		// client; do not touch dstClient or its registered business instances.
-		replacement, buildErr := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
-		if buildErr != nil {
-			return false, fmt.Errorf("rebuild worker heartbeat client: %w (previous error: %v)", buildErr, err)
-		}
-		rd.clientMu.Lock()
-		oldClient := rd.workerClient
-		rd.workerClient = replacement
-		rd.clientMu.Unlock()
-		if oldClient != nil {
-			e.mgr.CloseDedicatedNamingClient(oldClient)
-		}
-		if retryErr := e.worker.Ensure(replacement, d.DstCID, d.Namespace, d.ID); retryErr != nil {
-			return false, fmt.Errorf("re-register Worker heartbeat after reconnect: %w", retryErr)
-		}
-	}
-	return true, nil
 }
 
 // dstClient 取得向目标集群写实例的客户端——即本方向【专属】的命名客户端（见 runningDir.dstClient）。
