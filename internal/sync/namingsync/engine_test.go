@@ -477,19 +477,21 @@ func TestCleanupDirectionUsesBoundedConcurrentDeregistration(t *testing.T) {
 		dead:       make(map[string]regEntry),
 		failCount:  make(map[string]int),
 	}
-	want := cleanupConcurrency*2 + 7
-	for i := 0; i < want; i++ {
-		in := model.Instance{Ip: "10.0.0.1", Port: uint64(1000 + i), ClusterName: "DEFAULT"}
+	wantServices := cleanupConcurrency*2 + 7
+	for i := 0; i < wantServices; i++ {
 		svc := fmt.Sprintf("ORDER-%03d", i)
-		rd.registered[regKey(svc, in)] = regEntry{svc: svc, inst: in}
+		for j := 0; j < 3; j++ {
+			in := model.Instance{Ip: "10.0.0.1", Port: uint64(1000 + i*3 + j), ClusterName: "DEFAULT"}
+			rd.registered[regKey(svc, in)] = regEntry{svc: svc, inst: in}
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	e.cleanupDirection(ctx, rd)
 
-	if got := client.count.Load(); got != int32(want) {
-		t.Fatalf("cleanup processed %d instances, want %d", got, want)
+	if got := client.count.Load(); got != int32(wantServices) {
+		t.Fatalf("cleanup sent %d deregistration RPCs, want one per %d services", got, wantServices)
 	}
 	if got := client.max.Load(); got <= 1 {
 		t.Fatalf("cleanup should issue concurrent deregistrations, max concurrency=%d", got)
