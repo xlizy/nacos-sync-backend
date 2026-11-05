@@ -1900,6 +1900,7 @@ func (e *Engine) dstClient(rd *runningDir) (naming_client.INamingClient, error) 
 	d := rd.direction()
 	nc, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
 	if err != nil {
+		rd.republishAll.Store(true) // retry client creation on the next fast poll
 		return nil, fmt.Errorf("rebuild destination client for direction %s: %w", d.ID, err)
 	}
 	rd.clientMu.Lock()
