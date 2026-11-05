@@ -1304,6 +1304,12 @@ func (e *Engine) fastPoll(ctx context.Context, rd *runningDir) {
 			continue
 		}
 		natives := filterNatives(srcList)
+		if err := validateUniquePublishers(natives); err != nil {
+			e.setErr(d.ID, fmt.Errorf("source service %q cannot be represented by one direction client: %w", svc, err))
+			metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
+			queryFailed = true
+			continue
+		}
 
 		// 锁内只做状态登记/移除并收集网络操作，锁外经 dispatchOps 串行执行：
 		// 整个 tick 由 rd.opMu 串行化，保证同一方向的注册/注销严格有序——
@@ -1489,6 +1495,12 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 			continue
 		}
 		natives := filterNatives(srcList)
+		if err := validateUniquePublishers(natives); err != nil {
+			e.setErr(d.ID, fmt.Errorf("source service %q cannot be represented by one direction client: %w", svc, err))
+			metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
+			failed = true
+			continue
+		}
 
 		// 与真实目标对账：InstancesLive 实时 gRPC 查询（ServiceQuery 直发服务端，不读本地缓存）。
 		// 不能用 dst 专属客户端的 SelectAllInstances：其读 SDK 本地缓存+推送，本环境推送不可靠，
@@ -1680,8 +1692,24 @@ func filterNatives(srcList []model.Instance) map[string]model.Instance {
 	return natives
 }
 
+// validateUniquePublishers checks whether one shared publisher client can represent every source record.
+// Nacos publisher identity is client/service scoped; two source records with the same endpoint but different
+// metadata cannot be preserved as independent publishers through one destination client.
+func validateUniquePublishers(natives map[string]model.Instance) error {
+	seen := make(map[string]string, len(natives))
+	for spec, in := range natives {
+		endpoint := fmt.Sprintf("%s\x00%d\x00%s", in.Ip, in.Port, in.ClusterName)
+		if previous, ok := seen[endpoint]; ok && previous != spec {
+			return fmt.Errorf("multiple source publisher records share endpoint %s:%d cluster %q with different attributes",
+				in.Ip, in.Port, in.ClusterName)
+		}
+		seen[endpoint] = spec
+	}
+	return nil
+}
+
 func (e *Engine) proxiedMetadata(d *direction, in model.Instance) map[string]string {
-	md := make(map[string]string, len(in.Metadata)+4)
+	md := make(map[string]string, len(in.Metadata)+2)
 	for k, v := range in.Metadata {
 		md[k] = v
 	}
