@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
 	"github.com/nacos-group/nacos-sdk-go/v2/vo"
@@ -107,5 +108,99 @@ func TestForwardPublishesWhenTargetAlreadyHasSameContent(t *testing.T) {
 	}
 	if _, ok := e.pushed.Load(pushKey("source", "target", "public", "DEFAULT_GROUP", "app.yaml")); !ok {
 		t.Fatal("successful publish must record local echo")
+	}
+}
+
+
+type orderedSourceClient struct {
+	config_client.IConfigClient
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *orderedSourceClient) GetConfig(vo.ConfigParam) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.calls == 1 {
+		return "old-value", nil
+	}
+	return "new-value", nil
+}
+
+func (c *orderedSourceClient) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+type blockingPublishTarget struct {
+	config_client.IConfigClient
+	mu          sync.Mutex
+	published   []string
+	firstEnter  chan struct{}
+	releaseFirst chan struct{}
+}
+
+func (c *blockingPublishTarget) PublishConfig(p vo.ConfigParam) (bool, error) {
+	c.mu.Lock()
+	index := len(c.published)
+	c.published = append(c.published, p.Content)
+	c.mu.Unlock()
+	if index == 0 {
+		close(c.firstEnter)
+		<-c.releaseFirst
+	}
+	return true, nil
+}
+
+func (c *blockingPublishTarget) publishedValues() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.published...)
+}
+
+func TestForwardSerializesWritesForSameConfigKey(t *testing.T) {
+	src := &orderedSourceClient{}
+	tgt := &blockingPublishTarget{
+		firstEnter: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	e := &Engine{logger: zap.NewNop()}
+	link := config.SyncLink{From: "source", To: "target", Kind: "config"}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- e.forward(context.Background(), link, "public", "DEFAULT_GROUP", "app.yaml", "", src, tgt)
+	}()
+	<-tgt.firstEnter // first task has read old-value and is blocked inside publish
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- e.forward(context.Background(), link, "public", "DEFAULT_GROUP", "app.yaml", "", src, tgt)
+	}()
+	<-secondStarted
+
+	// While the first target write is blocked, the second same-key task must
+	// remain outside source refresh. Without serialization it would read and
+	// publish new-value before the first task completes.
+	time.Sleep(30 * time.Millisecond)
+	if got := src.callCount(); got != 1 {
+		close(tgt.releaseFirst)
+		t.Fatalf("second forward refreshed source while first write was in flight; GetConfig calls=%d", got)
+	}
+	close(tgt.releaseFirst)
+
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first forward failed: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second forward failed: %v", err)
+	}
+	got := tgt.publishedValues()
+	if len(got) != 2 || got[0] != "old-value" || got[1] != "new-value" {
+		t.Fatalf("same-key writes were not serialized in source-read order: %v", got)
 	}
 }
