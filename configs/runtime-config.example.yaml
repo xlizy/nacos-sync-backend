@@ -1,0 +1,19 @@
+nacos-group: #nacos组
+  - grp_id: vYRC #组ID,可自动生成,4为数字加大小写字母
+    grp_name: 203那套 #组名称,字符串最大16为字符
+    enable_auth: false #是否开启了认证
+    cluster: #集群
+      - c_id: QxIc #集群名称,可自动生成,4为数字加大小写字母
+        c_name: 公司机房 #集群名称
+        c_nodes: #集群节点
+          - 10.10.200.252:8848
+  - grp_id: q67E #组ID,可自动生成,4为数字加大小写字母
+    grp_name: 本地那套 #组名称,字符串最大16为字符
+    enable_auth: true #是否开启了认证
+    auth_username: nacos #认证用户名
+    auth_password: nacos #认证密码
+    cluster: #集群
+      - c_id: Odd1 #集群名称,可自动生成,4为数字加大小写字母
+        c_name: 公司机房 #集群名称
+        c_nodes: #集群节点
+          - 127.0.0.1:8848

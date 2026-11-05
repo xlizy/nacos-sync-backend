@@ -1,0 +1,31 @@
+# ===== 编辑器 / 操作系统 =====
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+
+# ===== Go 构建产物 =====
+# 编译输出的二进制（go build -o bin/...）
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# go test 生成的二进制
+*.test
+*.out
+
+# ===== 运行时日志 =====
+# bin/runtime.log、logging-path 下的 nacos-sync.log / nacos-sync-YYYYMMDD.log 等
+*.log
+
+# ===== 依赖（若日后启用 vendor 模式）=====
+/vendor/
+
+# ===== 环境变量 / 密钥文件（绝不提交真实凭据）=====
+# 注意：configs/*.yaml 需提交（密钥通过 ${ENV} 引用，不含明文）；
+# 切勿将含明文的 .env 加入版本库。
+.env
+.env.*
+*.env

@@ -1,0 +1,20 @@
+# nacos-sync-backend 引导配置（bootstrap）
+#
+# 本 Nacos 与同步目标集群完全无关，仅作为 nacos-sync-backend 自身的
+# 「配置中心」：服务启动后，按下方连接信息连上它，再从 configDataId
+# 指定的 dataId 拉取【运行时配置】（真正的同步拓扑、端口、范围等）。
+#
+# 磁盘上这份文件只负责「去哪取配置」，不放任何业务拓扑。
+
+nacos:
+  address: 10.10.199.68     # 配置中心 Nacos 地址（不含端口）
+  port: 8848                # 配置中心 Nacos 端口
+  username: nacos           # 访问该 Nacos 的用户名
+  password: ENC(fCjv6yst39A/exJJU+nfbD7o3ztW6PLHQlwU046QStpZ3Yqp)
+  cfg-namespace: "config"
+  reg-namespace: "public"
+  appname: NACOS-SYNC
+  configDataId: nacos-sync-backend-runtime.yaml  # 存放运行时配置的 dataId
+
+logging-path: /tmp
+secret-key: ${NACOS_SYNC_SECRET_KEY}

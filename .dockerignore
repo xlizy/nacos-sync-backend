@@ -1,0 +1,13 @@
+# 构建上下文排除：加速 docker build、减小上下文体积，且避免把旧产物/敏感缓存打进镜像
+bin/
+.git/
+*.log
+*.out
+Dockerfile
+.dockerignore
+node_modules/
+.idea/
+.vscode/
+.DS_Store
+# 本地临时配置（如 config.local.yaml）不要进镜像；config.yaml/pre/prod 需保留
+configs/*.local.yaml
