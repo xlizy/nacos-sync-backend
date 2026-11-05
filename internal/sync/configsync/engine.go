@@ -554,18 +554,11 @@ func (e *Engine) forward(ctx context.Context, link config.SyncLink, ns, group, d
 		}
 		data = fresh
 
-		// Active-Active 节点各自维护本地 echo 表，其他节点无法识别本次写入来源。
-		// 发布前比较目标当前值：若另一个同步节点已写入相同内容，则只登记本地 echo
-		// 并跳过写操作，避免重复通知进一步触发跨节点回声。
-		current, readErr := tgt.GetConfig(vo.ConfigParam{DataId: dataId, Group: group})
-		if readErr == nil && current == data {
-			e.recordPush(link.From, link.To, ns, group, dataId, data)
-			e.logger.Debug("target config already matches source, skip duplicate publish",
-				zap.String("link", linkKey(link)), zap.String("ns", ns),
-				zap.String("group", group), zap.String("dataId", dataId))
-			return nil
-		}
-
+		// Do not skip publication merely because target content already matches.
+		// Nacos config storage may be shared while change notifications are local
+		// to each cluster; a write is still needed to ignite target-side listeners.
+		// Local echo suppression prevents the ordinary return path. Cross-worker
+		// duplicate writes remain possible without a distributed idempotency key.
 		start := time.Now()
 		if data == "" {
 			ok, err := tgt.DeleteConfig(vo.ConfigParam{DataId: dataId, Group: group})
