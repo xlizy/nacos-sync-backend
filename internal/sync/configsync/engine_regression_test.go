@@ -8,6 +8,7 @@ import (
 
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
 	"github.com/nacos-group/nacos-sdk-go/v2/vo"
+	"go.uber.org/zap"
 
 	"github.com/cxcm/nacos-sync-backend/internal/config"
 )
@@ -60,7 +61,7 @@ func TestForwardDoesNotPublishStaleEventAfterSourceRefreshFailure(t *testing.T) 
 		{content: "fresh-source-value"},
 	}}
 	tgt := &retryTargetClient{failNext: true}
-	e := &Engine{}
+	e := &Engine{logger: zap.NewNop()}
 	link := config.SyncLink{From: "source", To: "target", Kind: "config"}
 
 	if err := e.forward(context.Background(), link, "public", "DEFAULT_GROUP", "app.yaml", "stale-event-value", src, tgt); err != nil {
