@@ -877,43 +877,52 @@ func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
 			return
 	}
 
-	e.logger.Info("cleanup direction: deregistering proxied instances",
-		zap.String("dir", d.ID), zap.Int("count", len(entries)))
+	// Nacos v2 的连接客户端对每个 (namespace, group, service) 只保存一个 publisher；
+	// BatchRegisterInstance 把该 publisher 设为完整实例集合，而服务端 DeregisterInstance
+	// 会直接 removeServiceInstance(service)，即一次注销会移除本连接该服务的整份发布集合。
+	// 因此这里必须按服务去重，不能对同一服务的每个实例重复发送注销 RPC。
+	services := make([]string, 0)
+	seenServices := make(map[string]struct{}, len(entries))
+	for _, re := range entries {
+		if _, ok := seenServices[re.svc]; ok {
+			continue
+		}
+		seenServices[re.svc] = struct{}{}
+		services = append(services, re.svc)
+	}
+	e.logger.Info("cleanup direction: deregistering proxied services",
+		zap.String("dir", d.ID), zap.Int("services", len(services)), zap.Int("instances", len(entries)))
 
-	// 有界并发注销：SDK 单次调用有独立超时且不接受 context，逐实例串行会让
-	// 400 个实例的关闭时间达到数十分钟。按 cleanupConcurrency 分批并发，
-	// 每批完成后检查方向/全局 deadline；最多只等待当前批次的 SDK 请求结束。
-	for start := 0; start < len(entries); start += cleanupConcurrency {
+	// 有界并发按服务执行注销：大量实例属于同一服务时只需一个 RPC；多个服务仍分批并发。
+	for start := 0; start < len(services); start += cleanupConcurrency {
 		select {
 		case <-ctx.Done():
-			e.logger.Warn("cleanup deregister aborted by timeout, some instances may linger", zap.String("dir", d.ID))
+			e.logger.Warn("cleanup deregister aborted by timeout, some services may linger", zap.String("dir", d.ID))
 			return
 		default:
 		}
 		end := start + cleanupConcurrency
-		if end > len(entries) {
-			end = len(entries)
+		if end > len(services) {
+			end = len(services)
 		}
 		var batch sync.WaitGroup
-		for _, entry := range entries[start:end] {
-			re := entry
+		for _, svc := range services[start:end] {
+			service := svc
 			batch.Add(1)
 			go func() {
 				defer batch.Done()
 				ok, err := client.DeregisterInstance(vo.DeregisterInstanceParam{
-					ServiceName: re.svc, GroupName: defaultGroup, Ip: re.inst.Ip, Port: re.inst.Port,
-					Ephemeral: true, Cluster: re.inst.ClusterName,
+					ServiceName: service, GroupName: defaultGroup, Ephemeral: true,
 				})
 				if err == nil && !ok {
 					err = fmt.Errorf("nacos rejected cleanup deregister")
 				}
 				if err != nil {
-					e.logger.Error("cleanup deregister proxied failed", zap.String("dir", d.ID), zap.String("svc", re.svc),
-						zap.String("inst", instKey(re.inst)), zap.Error(err))
+					e.logger.Error("cleanup deregister proxied service failed", zap.String("dir", d.ID), zap.String("svc", service), zap.Error(err))
 					metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 					return
 				}
-				e.logger.Info("cleanup deregister proxied ok", zap.String("dir", d.ID), zap.String("svc", re.svc), zap.String("inst", instKey(re.inst)))
+				e.logger.Info("cleanup deregister proxied service ok", zap.String("dir", d.ID), zap.String("svc", service))
 			}()
 		}
 		batch.Wait()
