@@ -178,6 +178,7 @@ type runningDir struct {
 	workerClient naming_client.INamingClient // 独立于数据客户端的方向存活登记连接
 	workerDead   atomic.Bool
 	republishAll atomic.Bool
+	writeFailed  atomic.Bool // 本方向最近一轮实例级写操作是否失败
 }
 
 // isStopped 报告该方向是否已被停止（准备/正在清理）。
@@ -1476,6 +1477,7 @@ func (e *Engine) dispatchOps(ctx context.Context, rd *runningDir, ops []regOp) {
 		if e.pl == nil { run(ctx); continue }
 		if err := e.pl.Submit(ctx, run); err != nil {
 			wg.Done()
+			rd.writeFailed.Store(true)
 			e.logger.Error("submit per-instance naming operation failed", zap.String("dir", rd.direction().ID), zap.String("svc", item.svc), zap.Error(err))
 			e.setErr(rd.direction().ID, err)
 		}
@@ -1499,6 +1501,7 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 	if !workerReady {
 		return
 	}
+	rd.writeFailed.Store(false)
 	// failed 记录本轮是否出现过取数/对账失败：失败时不能用 setOK 覆盖错误，
 	// 否则 /api/naming-sync 的 last_error 永远为空，排查时看不到真实失败原因。
 	var failed bool
@@ -1623,6 +1626,9 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 		rd.republishAll.Store(true)
 	}
 	e.updateCounts(rd)
+	if rd.writeFailed.Load() {
+		failed = true
+	}
 	if failed {
 		return // 保留本轮错误详情，不用 ok 覆盖
 	}
@@ -1812,10 +1818,15 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 			client = legacyClient
 			usingLegacyClient = true
 		} else {
-			if e.mgr == nil { e.setErr(d.ID, fmt.Errorf("nacos client manager is nil")); return }
+			if e.mgr == nil {
+				rd.writeFailed.Store(true)
+				e.setErr(d.ID, fmt.Errorf("nacos client manager is nil"))
+				return
+			}
 			nc, err := e.mgr.BuildDedicatedNamingClient(d.DstCID, d.Namespace)
 			if err != nil {
 				err = fmt.Errorf("build per-instance destination client dir=%q service=%q instance=%q: %w", d.ID, svc, instKey(in), err)
+				rd.writeFailed.Store(true)
 				e.setErr(d.ID, err)
 				metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 				return
@@ -1839,6 +1850,7 @@ func (e *Engine) registerProxied(ctx context.Context, rd *runningDir, svc string
 		delete(rd.instanceClients, rk)
 		rd.clientMu.Unlock()
 		rd.mu.Lock(); rd.failCount[rk]++; rd.mu.Unlock()
+		rd.writeFailed.Store(true)
 		metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
 		e.setErr(d.ID, err)
 		e.logger.Error("register proxied instance failed", zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)), zap.Error(err))
@@ -1880,6 +1892,7 @@ func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc stri
 		})
 		if err == nil && !ok { err = fmt.Errorf("nacos rejected deregister instance") }
 		if err != nil {
+			rd.writeFailed.Store(true)
 			e.setErr(d.ID, err)
 			e.logger.Error("deregister proxied instance failed", zap.String("dir", d.ID), zap.String("svc", svc), zap.String("instance", instKey(in)), zap.Error(err))
 			metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
@@ -1896,6 +1909,7 @@ func (e *Engine) deregisterProxied(ctx context.Context, rd *runningDir, svc stri
 		})
 		if err == nil && !ok { err = fmt.Errorf("nacos rejected deregister instance") }
 		if err != nil {
+			rd.writeFailed.Store(true)
 			e.setErr(d.ID, err)
 			e.logger.Error("deregister proxied failed", zap.String("dir", d.ID), zap.String("svc", svc), zap.String("inst", instKey(in)), zap.Error(err))
 			metrics.SyncErrors.WithLabelValues(d.ID, "naming").Inc()
