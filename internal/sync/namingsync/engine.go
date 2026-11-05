@@ -1853,8 +1853,25 @@ func (e *Engine) registerServiceProxied(ctx context.Context, rd *runningDir, svc
 	ok, err := client.BatchRegisterInstance(vo.BatchRegisterInstanceParam{
 		ServiceName: svc, GroupName: defaultGroup, Instances: instances,
 	})
-	if err == nil && !ok {
-		err = fmt.Errorf("nacos rejected batch register instances")
+	// nacos-sdk-go v2.3.5 only exposes (success, error) here. When the server
+	// responds success=false, the SDK drops the RPC response's errorCode/message.
+	// Preserve enough request context to identify the rejected service and endpoints.
+	endpoints := make([]string, 0, min(len(instances), 20))
+	for i, p := range instances {
+		if i >= 20 {
+			endpoints = append(endpoints, fmt.Sprintf("... and %d more", len(instances)-i))
+			break
+		}
+		endpoints = append(endpoints, fmt.Sprintf("%s:%d@%s", p.Ip, p.Port, p.ClusterName))
+	}
+	requestContext := fmt.Sprintf(
+		"target_cluster=%q namespace=%q service=%q group=%q instances=%d endpoints=[%s]",
+		d.DstCID, d.Namespace, svc, defaultGroup, len(instances), strings.Join(endpoints, ", "),
+	)
+	if err != nil {
+		err = fmt.Errorf("batch register request failed (%s): %w", requestContext, err)
+	} else if !ok {
+		err = fmt.Errorf("nacos rejected batch register instances (%s; nacos-sdk-go v2.3.5 did not expose the RPC response message)", requestContext)
 	}
 	if err != nil {
 		// Roll back this service's local desired snapshot so the next fast poll
