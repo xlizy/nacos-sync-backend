@@ -3,6 +3,7 @@ package namingsync
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -598,11 +599,20 @@ func TestDeregisterProxiedRepublishesRemainingInstances(t *testing.T) {
 	}
 }
 
-func TestRegisterProxiedRejectsMetadataOver1024Bytes(t *testing.T) {
+func TestNacosMetadataLengthCountsCharacters(t *testing.T) {
+	if got := nacosMetadataLength(map[string]string{"键": "中😀"}); got != 4 {
+		t.Fatalf("UTF-16 metadata length = %d, want 4", got)
+	}
+	if got := nacosMetadataLength(map[string]string{"k": strings.Repeat("中", 1023)}); got != 1024 {
+		t.Fatalf("metadata length = %d, want 1024", got)
+	}
+}
+
+func TestRegisterProxiedRejectsMetadataOver1024Characters(t *testing.T) {
 	client := singleInstanceNamingClient{registered: make(chan vo.RegisterInstanceParam, 1)}
 	in := model.Instance{
 		Ip: "10.0.0.1", Port: 8080,
-		Metadata: map[string]string{"payload": fmt.Sprintf("%01050d", 0)},
+		Metadata: map[string]string{"payload": strings.Repeat("x", 1024)},
 	}
 	rd := &runningDir{
 		d: &direction{ID: "g/s->g/d/", SrcCID: "src", DstCID: "dst"},
