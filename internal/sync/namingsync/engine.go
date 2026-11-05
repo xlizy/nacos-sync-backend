@@ -1580,7 +1580,7 @@ func (e *Engine) syncService(ctx context.Context, rd *runningDir) {
 		}
 		ours := make(map[string]model.Instance, len(dstAll))
 		for _, in := range dstAll {
-			if isOurs(in, d.SrcCID) {
+			if isOurs(in, d.SrcCID, d.ID) {
 				ours[instKey(in)] = in
 			}
 		}
