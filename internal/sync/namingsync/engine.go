@@ -773,12 +773,35 @@ func (e *Engine) stopDir(id string) {
 }
 
 // cleanupDirection 方向停止时撤销 Worker 心跳并关闭唯一目标客户端。
-func (e *Engine) cleanupDirection(ctx context.Context,rd *runningDir){
-	if rd==nil{return};d:=rd.direction();rd.opMu.Lock();defer rd.opMu.Unlock()
-	rd.mu.Lock();rd.stopped=true;rd.registered=make(map[string]regEntry);rd.dead=make(map[string]regEntry);rd.failCount=make(map[string]int);rd.mu.Unlock()
-	rd.clientMu.Lock();client:=rd.dstClient;rd.dstClient=nil;rd.clientMu.Unlock()
-	if client!=nil&&e.worker!=nil{if err:=e.worker.Leave(client,d.ID);err!=nil{e.logger.Warn("leave naming worker heartbeat failed",zap.String("dir",d.ID),zap.Error(err))}}
-	if client!=nil&&e.mgr!=nil{e.mgr.CloseDedicatedNamingClient(client)}
+// 方向客户端关闭后，该连接发布的全部 ephemeral 实例由 Nacos 自动摘除。
+func (e *Engine) cleanupDirection(ctx context.Context, rd *runningDir) {
+	if rd == nil {
+		return
+	}
+	d := rd.direction()
+	rd.opMu.Lock()
+	defer rd.opMu.Unlock()
+
+	rd.mu.Lock()
+	rd.stopped = true
+	rd.registered = make(map[string]regEntry)
+	rd.dead = make(map[string]regEntry)
+	rd.failCount = make(map[string]int)
+	rd.mu.Unlock()
+
+	rd.clientMu.Lock()
+	client := rd.dstClient
+	rd.dstClient = nil
+	rd.clientMu.Unlock()
+
+	if client != nil && e.worker != nil {
+		if err := e.worker.Leave(client, d.ID); err != nil {
+			e.logger.Warn("leave naming worker heartbeat failed", zap.String("dir", d.ID), zap.Error(err))
+		}
+	}
+	if client != nil && e.mgr != nil {
+		e.mgr.CloseDedicatedNamingClient(client)
+	}
 	_ = ctx
 }
 
@@ -974,7 +997,10 @@ func (e *Engine) sweepOrphans(ctx context.Context, cfg *config.Config) {
 func (e *Engine) isGloballyManaged(s sweepScan, svc string, inst model.Instance, cfg *config.Config, active map[string]bool) bool {
 	srcCID := inst.Metadata[metaSyncSourceCluster]
 	for _, d := range e.resolveDirections(cfg) {
-		if d.SrcCID == srcCID && d.DstCID == s.dstCID && d.Namespace == s.ns && active[d.ID] && directionManagesService(d, svc) { return true }
+		if d.SrcCID == srcCID && d.DstCID == s.dstCID && d.Namespace == s.ns &&
+			active[d.ID] && directionManagesService(d, svc) {
+			return true
+		}
 	}
 	return false
 }
@@ -1844,7 +1870,7 @@ func isProxied(in model.Instance) bool {
 	return in.Metadata[metaSyncSource] == "NACOS"
 }
 
-// isOurs 判断目标实例是否为「本方向（srcCID）」代注册上去的（用于精准清理，不越界）。
+// isOurs 判断目标实例是否由指定源集群代注册（归属仅使用 syncSourceCluster 字段）。
 func isOurs(in model.Instance, srcCID, _ string) bool {
 	return in.Metadata != nil && in.Metadata[metaSyncSource] == "NACOS" && in.Metadata[metaSyncSourceCluster] == srcCID
 }
